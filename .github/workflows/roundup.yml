@@ -1,0 +1,37 @@
+name: Weekly round-up
+
+on:
+  schedule:
+    - cron: '41 8 * * 2'   # Tuesdays, 08:41 UTC (start of the NFL week)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  roundup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node scripts/roundup.mjs
+      - name: Save week data
+        run: |
+          git config user.name "value-snapshot-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/week.json
+          git diff --cached --quiet || git commit -m "Weekly round-up data"
+          git pull --rebase
+          git push
+      - name: Post round-up as an issue (notifies your GitHub app)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          WEEK=$(node -e "console.log(require('./data/week.json').week)")
+          # close last week's round-up so only the latest stays open
+          for n in $(gh issue list --label roundup --state open --json number -q '.[].number'); do gh issue close "$n"; done
+          gh label create roundup --color 4fb3ff --description "Weekly round-up" 2>/dev/null || true
+          gh issue create --title "Week $WEEK round-up" --body-file roundup.md --label roundup

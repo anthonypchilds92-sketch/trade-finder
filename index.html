@@ -79,6 +79,7 @@
     </div>
     <nav id="tabs">
       <button data-tab="trades" class="on">Top trades</button>
+      <button data-tab="week">This week</button>
       <button data-tab="targets">Targets</button>
       <button data-tab="myteam">My team</button>
       <button data-tab="league">League</button>
@@ -92,6 +93,7 @@
   <div class="status" id="status">Fetching Sleeper and FantasyCalc…</div>
 
   <section id="tab-trades"></section>
+  <section id="tab-week" class="hidden"></section>
   <section id="tab-targets" class="hidden"></section>
   <section id="tab-myteam" class="hidden"></section>
   <section id="tab-league" class="hidden"></section>
@@ -661,6 +663,7 @@ const ENGINE = (() => {
       const dis = G.reduce((s, a) => s + (L.dislike[t.ownerId]?.[a.id] || 0) * a.value, 0) / 1000;
       if (dis) { res.partnerU -= dis; res.learned.push(`they didn't want ${G.filter(a => L.dislike[t.ownerId]?.[a.id]).map(a => a.name).join(', ')} last time`); }
     }
+    if (opts.partnerBonus) res.partnerU += opts.partnerBonus;
     if (res.partnerU <= (opts.minPartner ?? 0.15)) return fail('not enough in it for them');
     if (res.myU <= (opts.minMine ?? 0.2)) return fail('not enough in it for you');
     // Managers who actually trade are worth more of your time
@@ -720,6 +723,51 @@ const ENGINE = (() => {
       r.get.forEach(a => theirUse[a.id] = 1);
       if (out.length >= (prefs.maxResults ?? 20)) break;
     }
+    return out;
+  }
+
+  // ---- This week: who is short because of byes or injuries, and can I sell them a fix? ----
+  const OUT_RE = /^(IR|PUP|OUT|DOUBTFUL|SUS|NFI)/i;
+  function weeklyNeeds(model, prefs, byeTeams) {
+    const bye = new Set(byeTeams || []);
+    const why = p => bye.has(p.team) ? 'bye' : OUT_RE.test(p.injury || '') ? (p.injury || 'out') : null;
+    const wk = p => p.ppg != null ? p.ppg : p.now / 400; // weekly points proxy
+    const ctx = makeCtx(model, prefs);
+    const me = model.me;
+    const mine = myGivePool(model, prefs, { forOffer: true }).filter(a => a.kind === 'player' && !why(a));
+    const out = [];
+    for (const t of model.teams) {
+      if (t === me || t.strategy === 'rebuild') continue; // rebuilders don't chase weekly points
+      const wrap = l => l.map(p => Object.assign(Object.create(p), { wk: wk(p) }));
+      const full = lineupValue(wrap(t.players), model.slots, 'wk');
+      const week = lineupValue(wrap(t.players.filter(p => !why(p))), model.slots, 'wk');
+      const grp = f => f.reduce((g, [, p]) => (g[p.pos] = (g[p.pos] || 0) + p.wk, g), {});
+      const gF = grp(full.filled), gW = grp(week.filled);
+      const missing = full.filled.map(([, p]) => p).filter(p => why(p));
+      const usedGet = new Set();
+      for (const pos of ['QB', 'RB', 'WR', 'TE']) {
+        const gap = (gF[pos] || 0) - (gW[pos] || 0);
+        if (gap < 4) continue;
+        const reasons = missing.filter(p => p.pos === pos).map(p => `${p.name} (${why(p)})`);
+        // My available players at that position who would actually start for them
+        const cands = mine.filter(a => a.pos === pos && wk(a) >= 6).sort((x, y) => wk(y) - wk(x)).slice(0, 4);
+        const want = t.assets.filter(a => a.value >= 300 && (a.kind === 'pick' || a.ageMult >= 1 || a.breakout >= 0.45 || a.buyLow || a.injStash))
+          .sort((x, y) => ctx.myAssetScore(y) - ctx.myAssetScore(x)).slice(0, 12);
+        let best = null;
+        for (const c of cands) {
+          const urgency = Math.min(gap, wk(c)) * (t.strategy === 'winnow' ? 0.05 : 0.03);
+          for (const R of combos(want, 2)) {
+            if (R.length > 1 && prefs.evenDeals === 'strict') continue;
+            if (R.some(a => usedGet.has(a.id))) continue;
+            const r = evaluate(model, ctx, t, [c], R, { partnerBonus: urgency, minMine: 0.1 });
+            if (r.ok && (!best || r.score > best.score)) { best = r; best.urgency = urgency; }
+          }
+        }
+        if (best) best.get.forEach(a => usedGet.add(a.id));
+        out.push({ team: t, pos, gap, reasons, weekLineup: week.total, fullLineup: full.total, cands, trade: best });
+      }
+    }
+    out.sort((a, b) => (b.team.strategy === 'winnow') - (a.team.strategy === 'winnow') || b.gap - a.gap);
     return out;
   }
 
@@ -889,7 +937,7 @@ const ENGINE = (() => {
   }
   const fmt = x => Math.round(x).toLocaleString('en-GB');
 
-  return { buildModel, generateTrades, offersFor, asksFor, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
+  return { buildModel, generateTrades, offersFor, asksFor, weeklyNeeds, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
 })();
 if (typeof module !== 'undefined') module.exports = ENGINE;
 /*ENGINE-END*/
@@ -993,13 +1041,14 @@ async function load(force) {
     status('Loading player details, season stats and trade history…');
     RAW_ROSTERS = rosters.map(r => ({ roster_id: r.roster_id, owner_id: r.owner_id }));
     const season = nfl?.season || league.season;
-    const [sleeperPlayers, stats, history, tradeHistory] = await Promise.all([
+    const [sleeperPlayers, stats, history, weekInfo, tradeHistory] = await Promise.all([
       soft(force ? getJSON(`${SLEEPER}/players/nfl`) : cached('players', 86400000, () => getJSON(`${SLEEPER}/players/nfl`))),
       soft(getJSON(`${SLEEPER}/stats/nfl/regular/${season}`).catch(() => getJSON(`https://api.sleeper.com/stats/nfl/${season}?season_type=regular`))),
       soft(fetch('data/history.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
+      soft(fetch('data/week.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(loadTradeHistory(league, nfl?.week)),
     ]);
-    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory };
+    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo };
     rebuild();
     const missing = [!tradeHistory && 'trade history', !stats && 'season stats', !trending && 'trending adds', !sleeperPlayers && 'player details'].filter(Boolean);
     status(`Updated ${new Date().toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` + (missing.length ? ` · couldn't load ${missing.join(', ')}, so those signals are skipped` : ''));
@@ -1016,7 +1065,7 @@ function rebuild() {
   CARDS.length = 0;
   $('#title').textContent = RAW.league.name;
   $('#subtitle').textContent = `${MODEL.me.name} · ${MODEL.me.wins}–${MODEL.me.losses} · strategy: ${label(MODEL.me.strategy)}${RAW.week ? ` · week ${RAW.week}` : ''}`;
-  renderTrades(); renderTargets(); renderMyTeam(); renderLeague(); renderOffers(); renderSettings();
+  renderTrades(); renderWeek(); renderTargets(); renderMyTeam(); renderLeague(); renderOffers(); renderSettings();
 }
 const label = s => ({ winnow: 'Win now', middle: 'Middle', rebuild: 'Rebuild' }[s]);
 const stratPill = t => `<span class="pill ${t.strategy}">${label(t.strategy)}</span>`;
@@ -1042,6 +1091,37 @@ function renderTrades() {
       </div>`;
     }).join('');
   bindOfferButtons(el);
+}
+
+function renderWeek() {
+  const el = $('#tab-week');
+  const wi = RAW.weekInfo;
+  const byes = wi && String(wi.week) === String(RAW.week) ? wi.byes || [] : null;
+  const needs = ENGINE.weeklyNeeds(MODEL, P(), byes || []);
+  const others = [...MODEL.players.values()].filter(p => p.owner !== MODEL.me.rosterId);
+  const prevBL = new Set(wi?.prevBuyLows || []), prevST = new Set(wi?.prevStashes || []);
+  const newBL = wi ? others.filter(p => p.buyLow && !prevBL.has(p.id)) : [];
+  const newST = wi ? others.filter(p => p.injStash && !prevST.has(p.id)) : [];
+  const owner = id => MODEL.teamById.get(id)?.name || '';
+  const mini = list => list.map(p => `<tr class="tap" data-id="${esc(p.id)}"><td><b>${esc(p.name)}</b><div class="small">${esc(assetMeta(p))}</div></td><td class="small">${esc(owner(p.owner))}</td><td class="n">${fmt(p.value)}${p.buyLow ? `<div class="small" style="color:var(--bad)">−${Math.round(p.dropPct * 100)}%</div>` : `<div class="small">${esc(p.injury || '')}</div>`}</td></tr>`).join('');
+  el.innerHTML = `<p class="small">Week ${RAW.week || '?'}. ${byes ? `Teams on bye: ${byes.length ? byes.join(', ') : 'none'}.` : "Bye weeks load from the weekly round-up (every Tuesday), so for now only injuries are counted."} Worked out live from today's injuries and your settings.</p>
+  <h3 style="margin:14px 0 4px;font-size:16px">Teams short this week</h3>
+  <p class="small">Win-now and middle teams whose starting lineup has a hole this week, measured in points per game. A manager chasing a win may pay more than usual to fill it.</p>
+  ${needs.length ? needs.map(n => {
+    const tr = n.trade;
+    return `<div class="card"><div class="trade-top"><div><span class="partner">${esc(n.team.name)}</span> ${stratPill(n.team)}</div><span class="pill">${n.team.wins}–${n.team.losses}</span></div>
+      <div>Short about <b>${n.gap.toFixed(1)} pts</b> at <b>${n.pos}</b>${n.reasons.length ? `: ${esc(n.reasons.join(', '))}` : ''}.</div>
+      ${tr ? `<div class="sides" style="margin-top:8px"><div class="side"><h4>You give</h4>${assetRows(tr.give)}</div><div class="side"><h4>You get</h4>${assetRows(tr.get)}</div></div>
+        <ul class="why">${ENGINE.explain(tr, MODEL).map(w => `<li>${esc(w)}</li>`).join('')}<li>They need a ${n.pos} this week, so the urgency should get you a little extra.</li></ul>${offerButton(tr)}`
+      : n.cands.length ? `<div class="small" style="margin-top:6px">You have ${n.cands.map(c => esc(c.name)).join(', ')} at ${n.pos}, but no fair deal with them works for your rebuild right now.</div>`
+      : `<div class="small" style="margin-top:6px">You don't have a tradeable ${n.pos} who would start for them.</div>`}</div>`;
+  }).join('') : '<div class="card small">No contending team has a meaningful hole this week.</div>'}
+  <h3 style="margin:18px 0 4px;font-size:16px">New buy-low candidates</h3>
+  ${!wi ? '<div class="card small">This fills in after the first weekly round-up runs.</div>' : newBL.length ? `<div class="card scroll"><table><tbody>${mini(newBL)}</tbody></table></div>` : '<div class="card small">No new buy-low candidates since the last round-up.</div>'}
+  <h3 style="margin:18px 0 4px;font-size:16px">New injury stashes</h3>
+  ${!wi ? '<div class="card small">This fills in after the first weekly round-up runs.</div>' : newST.length ? `<div class="card scroll"><table><tbody>${mini(newST)}</tbody></table></div>` : '<div class="card small">No new injury stashes since the last round-up.</div>'}`;
+  bindOfferButtons(el);
+  el.querySelectorAll('tr.tap').forEach(tr => tr.onclick = () => { document.querySelector('nav button[data-tab="targets"]').click(); const row = document.querySelector(`#tab-targets tr.tap[data-id="${tr.dataset.id}"]`); if (row) { row.scrollIntoView({ block: 'center' }); toggleOffers(row); } });
 }
 
 function renderTargets() {
