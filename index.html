@@ -295,10 +295,17 @@ const ENGINE = (() => {
         if (p.value < 300 && !(sig.usage > 0.6)) p.breakout *= 0.5;
         p.ageMult = ageMult(p.pos, p.age);
         p.future = p.value * p.ageMult;
+        // Sell high, not low: rising value = near peak (good time to sell);
+        // falling value with the role intact = situational dip (hold, don't sell low).
         const decline = clamp((1 - p.ageMult) / 0.5);
         const nowRatio = clamp((p.now / Math.max(1, p.value) - 0.45) / 0.5);
-        const negTrend = clamp(-p.trend / Math.max(1, p.value) / 0.15);
-        p.sell = 0.55 * decline + 0.3 * nowRatio + 0.15 * negTrend;
+        const trendPct = p.trend / base;
+        p.trendPct = trendPct;
+        const peak = clamp(trendPct / 0.10);
+        p.sell = 0.5 * decline + 0.25 * nowRatio + 0.25 * peak;
+        const roleIntact = sig.usage == null ? true : sig.usage >= 0.6;
+        p.dip = trendPct <= -0.05 && p.value >= 1500 && roleIntact;
+        if (trendPct <= -0.05) p.sell *= p.dip ? 0.35 : 0.7;
       }
     }
     for (const p of players.values()) if (!SKILL.includes(p.pos)) {
@@ -381,6 +388,8 @@ const ENGINE = (() => {
       if (m === 'protect') return false;
       if (m === 'shop') return true;
       if (a.kind === 'pick') return !prefs.protectPicks && a.value >= 400;
+      if (a.dip) return false; // never sell a star during a situational dip unless marked Shop
+      if (a.trendPct <= -0.08) return false; // avoid selling into a falling market
       return a.value >= 600 && (a.sell >= 0.35 || a.ageMult < 0.9);
     }).sort((a, b) => (b.sell * b.value) - (a.sell * a.value)).slice(0, 12);
 
@@ -475,8 +484,9 @@ const ENGINE = (() => {
     const bits = [];
     if (a.age) bits.push(`age ${Math.floor(a.age)}`);
     if (a.ageMult < 0.9) bits.push(`${a.pos}s usually lose value from here (we expect him to keep about ${Math.round(a.ageMult * 100)}% over 2 years)`);
+    if (a.trend > 0 && (a.trendPct ?? 0) >= 0.03) bits.push(`value up ${fmt(a.trend)} in 30 days, so you're selling near the top`);
+    else if ((a.trendPct ?? 0) > -0.03) bits.push('value is steady, close to its peak');
     if (a.now / Math.max(1, a.value) > 0.7) bits.push('worth more to a contender this season than to your rebuild');
-    if (a.trend < 0) bits.push(`value already down ${fmt(-a.trend)} in 30 days`);
     if (!bits.length) bits.push('selling now gets more back than he is likely to be worth later');
     return bits.join(', ') + '.';
   }
@@ -618,12 +628,13 @@ function renderMyTeam() {
   const tags = a => {
     if (a.kind === 'pick') return '';
     let t = '';
-    if (a.sell >= 0.45) t += '<span class="tag sell">sell</span>';
+    if (a.dip) t += '<span class="tag buy" title="Value down but role intact: hold, don\'t sell low">dip · hold</span>';
+    else if (a.sell >= 0.45) t += '<span class="tag sell">sell high</span>';
     if (a.breakout >= 0.55) t += '<span class="tag buy">core</span>';
     if (starters.has(a.id)) t += '<span class="tag">starter</span>';
     return t;
   };
-  $('#tab-myteam').innerHTML = `<p class="small"><b>Protect</b> keeps a player out of every trade, and <b>Shop</b> forces him into the trade search. <b>Auto</b> lets the site decide: it shops players who are past their age peak or whose value is mostly about this season.</p>
+  $('#tab-myteam').innerHTML = `<p class="small"><b>Protect</b> keeps a player out of every trade, and <b>Shop</b> forces him into the trade search. <b>Auto</b> lets the site decide: it shops players near their value peak who are past their age peak or whose value is mostly about this season. It won't sell anyone whose value is falling. "Dip · hold" marks a player whose value has dropped while his role hasn't, which is a bad time to sell.</p>
   <div class="card scroll"><table><thead><tr><th>Asset</th><th class="n">Value</th><th class="n">2-yr</th><th>Trade?</th></tr></thead><tbody>
   ${rows.map(a => `<tr><td><b>${esc(a.name)}</b>${tags(a)}<div class="small">${esc(assetMeta(a))}${a.injury ? ' · ' + esc(a.injury) : ''}</div></td>
   <td class="n">${fmt(a.value)}</td><td class="n" style="color:${a.ageMult >= 1 ? 'var(--good)' : a.ageMult < 0.8 ? 'var(--bad)' : 'var(--muted)'}">${fmt(a.future)}</td><td>${markBtns(a)}</td></tr>`).join('')}
