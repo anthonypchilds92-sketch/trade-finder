@@ -4,9 +4,17 @@
 import { readFile, writeFile } from 'node:fs/promises';
 
 const UA = 'Mozilla/5.0 (personal dynasty trade-finder; one request per day)';
-const html = await (await fetch('https://keeptradecut.com/dynasty-rankings?page=0&filters=QB|WR|RB|TE|RDP&format=2', { headers: { 'User-Agent': UA } })).text();
-const m = html.match(/var\s+playersArray\s*=\s*(\[[\s\S]*?\]);/);
-if (!m) throw new Error('KTC playersArray not found (page format changed?)');
+const res = await fetch('https://keeptradecut.com/dynasty-rankings?page=0&filters=QB|WR|RB|TE|RDP&format=2', { headers: { 'User-Agent': UA, 'Accept': 'text/html' } });
+const html = await res.text();
+const m = html.match(/(?:var|let|const)\s+playersArray\s*=\s*(\[[\s\S]*?\]);\s*\n/) || html.match(/playersArray\s*=\s*(\[[\s\S]*?\]);/);
+if (!m) {
+  console.log('status', res.status, 'length', html.length);
+  console.log('title', (html.match(/<title>([^<]*)/) || [])[1]);
+  for (const key of ['playersArray', 'superflexValues', 'oneQBValues', 'cf-chl', 'challenge', '__NEXT_DATA__']) {
+    const i = html.indexOf(key); console.log(key, i, i >= 0 ? JSON.stringify(html.slice(Math.max(0, i - 80), i + 160)) : '');
+  }
+  throw new Error('KTC playersArray not found (page format changed?)');
+}
 const arr = JSON.parse(m[1]);
 
 // Name matching against Sleeper IDs (FantasyCalc gives names + Sleeper IDs; Sleeper's player list covers the rest)
