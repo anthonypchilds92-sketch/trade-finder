@@ -32,6 +32,7 @@ for (const [id, p] of Object.entries(sleeper)) {
   if (byName.has(key)) byName.set(key, null); else byName.set(key, { id, name, pos: p.position, team: p.team });
 }
 
+console.log('names indexed:', byName.size, 'sample:', [...byName.keys()].slice(0, 5).join(' | '));
 const strip = h => h.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8217;|&rsquo;/g, "'").replace(/&#\d+;/g, ' ').replace(/\s+/g, ' ');
 const tag = (xml, t) => { const m = xml.match(new RegExp(`<${t}[^>]*>([\\s\\S]*?)<\\/${t}>`, 'i')); return m ? m[1].replace(/^<!\[CDATA\[|\]\]>$/g, '').trim() : ''; };
 const since = Date.now() - DAYS * 86400000;
@@ -78,13 +79,16 @@ for (const [src, url] of FEEDS) {
       }
     }
     sources.push({ src, ok: true, articles: used });
+    if (used) { const it0 = items[0]; console.log(`[${src}] sample text:`, strip(`${tag(it0, 'description')} ${tag(it0, 'content:encoded')}`).slice(0, 300)); }
   } catch (e) { sources.push({ src, ok: false, error: e.message }); }
 }
 
 const list = [...players.values()].map(e => ({
   id: e.id, name: e.name, pos: e.pos, team: e.team, up: e.up, down: e.down,
   sources: [...e.sources], score: (e.up - e.down) * Math.sqrt(e.sources.size), articles: [...e.articles.values()],
-})).filter(e => e.up + e.down >= 2).sort((a, b) => b.score - a.score);
+})).sort((a, b) => b.score - a.score);
+console.log('raw matches:', list.length);
+list.splice(0, list.length, ...list.filter(e => e.up + e.down >= 2));
 await writeFile('data/experts.json', JSON.stringify({ generatedAt: new Date().toISOString(), days: DAYS, sources, players: list.slice(0, 150) }));
 console.log('Sources:', sources.map(s => `${s.src}: ${s.ok ? s.articles + ' articles' : 'failed ' + (s.status || s.error)}`).join(' | '));
 console.log('Top tipped:', list.slice(0, 15).map(p => `${p.name} (+${p.up}/-${p.down}, ${p.sources.length} src)`).join(', '));
