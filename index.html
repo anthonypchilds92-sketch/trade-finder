@@ -908,7 +908,7 @@ const ENGINE = (() => {
   }
 
   // ---- Free agents worth picking up ----
-  function freeAgents(model, prefs) {
+  function freeAgents(model, prefs, opts = {}) {
     const sp = model.sleeperPlayers;
     if (!sp) return { list: [], reason: 'Player details from Sleeper are needed for free agents.' };
     const OUTR = /^(IR|PUP|OUT|SUS|NFI|DOUBTFUL)/i;
@@ -956,7 +956,8 @@ const ENGINE = (() => {
       const prod = ppg == null ? 0 : clamp(ppg / 14);
       const vScore = clamp(value / 2500);
       const score = W.opp * opp + W.buzz * buzz + W.value * vScore + W.youth * youth + W.prod * prod;
-      if (score < 0.18 && value < 400) continue;
+      if (!opts.byPpg && score < 0.18 && value < 400) continue;
+      if (opts.byPpg && (ppg == null || ppg < 5 || OUTR.test(p.injury_status || ''))) continue;
       const est = value + 900 * opp + 500 * buzz + (rebuild ? 400 * youth : 300 * prod);
       const notes = [];
       if (oppNote) notes.push(oppNote);
@@ -966,6 +967,7 @@ const ENGINE = (() => {
       if (value) notes.push(`value ${fmt(value)}`);
       out.push({ id, name: nameOf(p), pos: p.position, team: p.team, age, value, adds, ppg, opp, score, est, notes, injury: p.injury_status || null });
     }
+    if (opts.byPpg) return { list: out.sort((a, b) => b.ppg - a.ppg).slice(0, 15) };
     out.sort((a, b) => b.score - a.score);
     const list = out.slice(0, 25);
     // Drop candidates: your least valuable players (not protected, not injury stashes / buy-low holds)
@@ -1495,6 +1497,99 @@ function expertSection() {
   ${cooling.length ? `<h3 style="margin:14px 0 4px;font-size:15px">Experts cooling on your players</h3><p class="small">More negative than positive mentions recently. Consider selling before the market follows.</p><div class="card scroll"><table><tbody>${cooling.map(line).join('')}</tbody></table></div>` : ''}`;
 }
 
+// ---------- Weekly strategy brief ----------
+function weeklyPpg(players) {
+  return ENGINE.lineupValue(players.filter(p => !p.onTaxi && p.pos).map(p => Object.assign(Object.create(p), { wk: p.ppg || 0 })), MODEL.slots, 'wk').total;
+}
+function strategyBrief(needs) {
+  const reg = (RAW.league.settings?.playoff_week_start || 15) - 1;
+  if (!RAW.matchups) return '';
+  const D = ENGINE.draftOrder(MODEL, RAW.matchups, reg);
+  if (!D.played) return '';
+  const me = D.rows.find(r => r.team === MODEL.me);
+  const others = D.rows.filter(r => r !== me);
+  const goal = Object.assign({ mode: 'above' }, prefs.draftGoal || {});
+  const tgt = goal.mode === 'above' ? (others.find(r => String(r.team.rosterId) === String(goal.rid)) || others[0]) : others[0];
+  const left = Math.max(0, reg - D.played);
+  const margin = me.maxPF - tgt.maxPF;
+  const projMargin = margin + (me.recentAvg - tgt.recentAvg) * left;
+  const myBase = weeklyPpg(MODEL.me.players);
+  const items = [];
+  let head, tone;
+  // --- where you stand ---
+  if (goal.mode === 'off') { head = `You're at pick ${me.slot} on max PF.`; tone = 'accent'; }
+  else if (goal.mode === 'tank') {
+    const gap = me.maxPF - tgt.maxPF; // tgt = lowest other team
+    if (left === 0) { head = gap < 0 ? 'Regular season over: you finished with the lowest max PF. Pick 1 is yours.' : `Regular season over: you finished pick ${me.slot}.`; tone = gap < 0 ? 'good' : 'warn'; }
+    else if (projMargin < 0) { head = `On course for the lowest max PF: ${Math.abs(gap).toFixed(1)} below ${tgt.team.name}, with ${left} week${left === 1 ? '' : 's'} left.`; tone = 'good'; }
+    else { head = `You're ${gap.toFixed(1)} above ${tgt.team.name}, the lowest max PF. Sell or bench-proof your scorers to get below them.`; tone = 'warn'; }
+  } else {
+    if (left === 0) { head = margin > 0 ? `Regular season over: you finished ${margin.toFixed(1)} above ${tgt.team.name} on max PF. Job done, so sell your veterans to playoff teams now.` : `Regular season over: you finished ${(-margin).toFixed(1)} below ${tgt.team.name}.`; tone = margin > 0 ? 'good' : 'bad'; }
+    else if (projMargin < 0) {
+      const need = -projMargin / left + 3;
+      head = `${margin < 0 ? `You're ${(-margin).toFixed(1)} behind` : `You're only ${margin.toFixed(1)} ahead of`} ${tgt.team.name} on max PF, and at recent rates you'd finish ${(-projMargin).toFixed(1)} behind. With ${left} week${left === 1 ? '' : 's'} left, you need about <b>${need.toFixed(1)} more points a week</b>.`;
+      tone = 'bad';
+    } else if (projMargin < 8 * left) { head = `You're on track to finish ${projMargin.toFixed(1)} above ${tgt.team.name} on max PF, which is still tight with ${left} week${left === 1 ? '' : 's'} left. Add points where it's cheap and hold your scorers.`; tone = 'warn'; }
+    else { head = `You're comfortably on track to finish ${projMargin.toFixed(1)} above ${tgt.team.name} on max PF. You can afford to start selling.`; tone = 'good'; }
+  }
+  const needPoints = goal.mode === 'above' && left > 0 && projMargin < 8 * left;
+  const canSell = goal.mode !== 'above' || left === 0 || projMargin >= 8 * left;
+  const trCard = (tr, extra) => `<div class="card" style="margin:8px 0"><div class="small" style="margin-bottom:6px"><b>${esc(tr.partner.name)}</b> ${stratPill(tr.partner)}${extra ? ' · ' + extra : ''}</div>
+    <div class="sides"><div class="side"><h4>You give</h4>${assetRows(tr.give)}</div><div class="side"><h4>You get</h4>${assetRows(tr.get)}</div></div>${offerButton(tr)}</div>`;
+  const gainOf = tr => weeklyPpg(MODEL.me.players.filter(p => !tr.give.includes(p)).concat(tr.get.filter(a => a.kind === 'player'))) - myBase;
+
+  if (needPoints) {
+    // 1) Hold scorers until the regular season ends
+    const scorers = MODEL.me.players.filter(p => (p.ppg || 0) >= 8 && (p.sell >= 0.35 || p.ageMult < 0.9)).sort((a, b) => b.ppg - a.ppg).slice(0, 4);
+    if (scorers.length) items.push(`<b>Hold your scoring veterans until week ${reg}:</b> ${scorers.map(p => `${esc(p.name)} (${p.ppg.toFixed(1)} ppg)`).join(', ')}. Every point they score on your bench counts. There's no trade deadline, so sell them to playoff teams after the regular season.`);
+    // 2) Free-agent points
+    const fas = ENGINE.freeAgents(MODEL, P(), { byPpg: true }).list
+      .map(f => ({ f, gain: weeklyPpg(MODEL.me.players.concat([{ id: f.id, pos: f.pos, ppg: f.ppg }])) - myBase })).filter(x => x.gain >= 0.5).slice(0, 3);
+    if (fas.length) items.push(`<b>Free points on waivers:</b> ${fas.map(x => `${esc(x.f.name)} (${x.f.pos}, ${esc(x.f.team)}, ${x.f.ppg.toFixed(1)} ppg, about +${x.gain.toFixed(1)} a week to your max PF)`).join('; ')}. A cheap bid now, and drop them after week ${reg}.`);
+    // 3) Trades that add points now AND suit the rebuild
+    const cands = [...MODEL.players.values()].filter(p => p.owner !== MODEL.me.rosterId && (p.ppg || 0) >= 8 && !p.injuredOut && (p.ageMult >= 1 || p.taxiNext || p.breakout >= 0.45))
+      .sort((a, b) => (b.ppg * (1 + b.breakout)) - (a.ppg * (1 + a.breakout))).slice(0, 10);
+    const offers = [];
+    for (const c of cands) {
+      const o = ENGINE.offersFor(MODEL, P(), c.id, 3).offers.map(tr => ({ tr, gain: gainOf(tr) })).filter(x => x.gain > 0.5).sort((a, b) => b.gain - a.gain)[0];
+      if (o) offers.push(o);
+      if (offers.length >= 2) break;
+    }
+    if (offers.length) items.push(`<b>Trades that add points now and suit your rebuild:</b>` + offers.map(o => trCard(o.tr, `about +${o.gain.toFixed(1)} a week to your max PF`)).join(''));
+  }
+  if (canSell) {
+    // Sell-high: big week last week, or a contender short at his position
+    const lastW = Math.max(...Object.keys(RAW.matchups).filter(w => RAW.matchups[w]).map(Number));
+    const lastPts = Object.assign({}, ...(RAW.matchups[lastW] || []).map(m => m.players_points || {}));
+    const hot = MODEL.me.players.filter(p => (p.sell >= 0.3 || p.ageMult < 0.95) && (lastPts[p.id] || 0) >= Math.max(15, 1.5 * (p.ppg || 0))).sort((a, b) => (lastPts[b.id] || 0) - (lastPts[a.id] || 0));
+    const sells = [];
+    for (const p of hot.slice(0, 3)) {
+      const n = needs.find(n => n.trade && n.trade.give.includes(p)) || needs.find(n => n.pos === p.pos && n.trade);
+      const tr = n?.trade?.give.includes(p) ? n.trade : ENGINE.generateTrades(MODEL, Object.assign(P(), { marks: Object.assign({}, prefs.marks, { [p.id]: 'shop' }) })).find(t => t.give.includes(p));
+      const loss = tr ? -gainOf(tr) : 0;
+      if (goal.mode === 'above' && left > 0 && loss * left > projMargin - 4 * left) continue; // would put the max PF goal at risk
+      sells.push(`<b>Sell high on ${esc(p.name)}:</b> ${(lastPts[p.id] || 0).toFixed(1)} points last week against his ${(p.ppg || 0).toFixed(1)} average${n ? `, and ${esc(n.team.name)} are short at ${n.pos} this week` : ''}.` + (tr ? trCard(tr, loss > 0.5 && left > 0 ? `costs you about ${loss.toFixed(1)} a week of max PF` : '') : ''));
+    }
+    if (sells.length) items.push(...sells);
+    else if (left === 0 || goal.mode !== 'above') {
+      const top = ENGINE.generateTrades(MODEL, P())[0];
+      if (top) items.push(`<b>Best sell this week:</b>` + trCard(top, ''));
+    }
+  }
+  // Always: one market-inefficiency tip and the taxi count
+  const tip = (RAW.experts?.players || []).map(e => ({ e, p: MODEL.players.get(String(e.id)) })).find(x => x.p && x.p.owner !== MODEL.me.rosterId && x.e.up > x.e.down && Math.abs(x.p.trend / Math.max(1, x.p.value)) < 0.03 && (x.p.ageMult >= 1 || x.p.taxiNext));
+  if (tip) items.push(`<b>Before the market moves:</b> experts are tipping ${esc(tip.p.name)} (${esc(MODEL.teamById.get(tip.p.owner)?.name || '')}) but his value hasn't moved yet. See Expert tips below.`);
+  const taxiN = MODEL.me.players.filter(p => p.taxiNext && p.value >= 800).length;
+  if (taxiN < (prefs.taxiGoal ?? 4)) items.push(`<b>Taxi squad for next season:</b> you have ${taxiN} rookie${taxiN === 1 ? '' : 's'} worth 800 or more; you're aiming for ${prefs.taxiGoal ?? 4}. Targets are listed in the Targets tab.`);
+  const col = { good: 'var(--good)', warn: 'var(--warn)', bad: 'var(--bad)', accent: 'var(--accent)' }[tone];
+  const others2 = MODEL.teams.filter(t => t !== MODEL.me);
+  return `<div class="card" style="border-color:${col}"><div class="trade-top"><b style="font-size:16px">Strategy brief · week ${RAW.week || ''}</b>
+      <select id="goal-mode" style="font-size:12px;padding:3px 6px"><option value="above" ${goal.mode === 'above' ? 'selected' : ''}>Stay above…</option><option value="tank" ${goal.mode === 'tank' ? 'selected' : ''}>Lowest max PF</option><option value="off" ${goal.mode === 'off' ? 'selected' : ''}>No draft goal</option></select></div>
+    ${goal.mode === 'above' ? `<div class="row" style="margin-bottom:6px"><span class="small">Target:</span><select id="goal-team" style="font-size:12px;padding:3px 6px">${others2.map(t => `<option value="${t.rosterId}" ${t === tgt.team ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select></div>` : ''}
+    <div style="color:${col}">${head}</div>
+    <ul class="why" style="margin-top:8px">${items.map(i => `<li style="margin:6px 0">${i}</li>`).join('')}</ul></div>`;
+}
+
 function renderWeek() {
   const el = $('#tab-week');
   const wi = RAW.weekInfo;
@@ -1506,7 +1601,7 @@ function renderWeek() {
   const newST = wi ? others.filter(p => p.injStash && !prevST.has(p.id)) : [];
   const owner = id => MODEL.teamById.get(id)?.name || '';
   const mini = list => list.map(p => `<tr class="tap" data-id="${esc(p.id)}"><td><b>${esc(p.name)}</b><div class="small">${esc(assetMeta(p))}</div></td><td class="small">${esc(owner(p.owner))}</td><td class="n">${fmt(p.value)}${p.buyLow ? `<div class="small" style="color:var(--bad)">−${Math.round(p.dropPct * 100)}%</div>` : `<div class="small">${esc(p.injury || '')}</div>`}</td></tr>`).join('');
-  el.innerHTML = `<p class="small">Week ${RAW.week || '?'}. ${byes ? `Teams on bye: ${byes.length ? byes.join(', ') : 'none'}.` : "Bye weeks load from the weekly round-up (every Tuesday), so for now only injuries are counted."} Worked out live from today's injuries and your settings.</p>
+  el.innerHTML = strategyBrief(needs) + `<p class="small">Week ${RAW.week || '?'}. ${byes ? `Teams on bye: ${byes.length ? byes.join(', ') : 'none'}.` : "Bye weeks load from the weekly round-up (every Tuesday), so for now only injuries are counted."} Worked out live from today's injuries and your settings.</p>
   <h3 style="margin:14px 0 4px;font-size:16px">Teams short this week</h3>
   <p class="small">Win-now and middle teams whose starting lineup has a hole this week, measured in points per game. A manager chasing a win may pay more than usual to fill it.</p>
   ${needs.length ? needs.map(n => {
@@ -1524,6 +1619,8 @@ function renderWeek() {
   <h3 style="margin:18px 0 4px;font-size:16px">New injury stashes</h3>
   ${!wi ? '<div class="card small">This fills in after the first weekly round-up runs.</div>' : newST.length ? `<div class="card scroll"><table><tbody>${mini(newST)}</tbody></table></div>` : '<div class="card small">No new injury stashes since the last round-up.</div>'}`;
   bindOfferButtons(el);
+  if ($('#goal-mode')) $('#goal-mode').onchange = e => { prefs.draftGoal = Object.assign({}, prefs.draftGoal, { mode: e.target.value }); savePrefs(); renderWeek(); };
+  if ($('#goal-team')) $('#goal-team').onchange = e => { prefs.draftGoal = Object.assign({}, prefs.draftGoal, { rid: e.target.value }); savePrefs(); renderWeek(); };
   el.querySelectorAll('tr.xtap').forEach(tr => tr.onclick = e => { if (e.target.closest('a')) return; toggleOffers(tr); });
   el.querySelectorAll('tr.tap').forEach(tr => tr.onclick = () => { document.querySelector('nav button[data-tab="targets"]').click(); const row = document.querySelector(`#tab-targets tr.tap[data-id="${tr.dataset.id}"]`); if (row) { row.scrollIntoView({ block: 'center' }); toggleOffers(row); } });
 }
