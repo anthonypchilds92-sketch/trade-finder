@@ -222,6 +222,114 @@ const ENGINE = (() => {
     return out;
   }
 
+  // ---- Injuries ----
+  // Out/IR players score nothing for a contender this season, so their price dips. Young ones with a
+  // good recovery outlook are classic rebuilder buys.
+  const SEVERE = /achilles/i;
+  const LONG = /acl|mcl|knee|lisfranc|patell|tibia|fibula|fracture|broken|leg|neck|spine|pectoral|foot/i;
+  function injuryAssess(p) {
+    const st = (p.injury || '').toUpperCase();
+    const outNow = /^(IR|PUP|OUT|DOUBTFUL|SUS|NFI)/.test(st);
+    p.injuredOut = outNow;
+    if (!outNow) { p.injStash = false; return; }
+    const body = `${p.injuryBody || ''} ${p.injuryNotes || ''}`;
+    let recovery = SEVERE.test(body) ? 0.65 : LONG.test(body) ? 0.85 : 0.95;
+    p.injSeverity = SEVERE.test(body) ? 'severe' : LONG.test(body) ? 'long-term' : 'short-term';
+    const age = p.age ?? 30;
+    if (age <= 24) recovery += 0.05; else if (age >= 27) recovery -= 0.1;
+    p.injRecovery = clamp(recovery, 0.4, 1);
+    // A contender gets little or nothing from him this season
+    p.now *= /^(IR|PUP|NFI)/.test(st) ? 0.1 : st.startsWith('OUT') || st.startsWith('SUS') ? 0.5 : 0.7;
+    // Worth stashing: young, was a real asset, decent recovery odds
+    const quality = p.value >= 1500 || (p.yoe ?? 9) <= 1 && p.value >= 800 || (p.peakValue ?? 0) >= 2000;
+    p.injStash = age <= 26 && quality && p.injRecovery >= 0.75;
+    p.injRebound = p.injStash ? Math.max(p.peakValue || p.value, p.value * 1.2) * p.ageMult * p.injRecovery : null;
+  }
+
+  // ---- Trade history: what each manager tends to do ----
+  // tradeHistory = [{ season, rosters: [{roster_id, owner_id}], txns: [...] }]
+  // Values are today's FantasyCalc values (a guide to what moved, not what it was worth at the time).
+  function buildTendencies(tradeHistory, teams, { fcById, sleeperPlayers, pickValue }) {
+    const log = [];
+    for (const t of teams) t.profile = { trades: 0, seasons: new Set(), partners: {}, picksIn: 0, picksOut: 0, piecesIn: 0, piecesOut: 0, ageIn: [0, 0], ageOut: [0, 0], posIn: {}, valIn: 0, valOut: 0, tags: [], favPos: [], perSeason: 0, pickNet: 0, consol: 0, ageNet: 0 };
+    if (!tradeHistory?.length) return log;
+    const byOwner = new Map(teams.map(t => [t.ownerId, t]));
+    const nowYear = new Date().getFullYear() + new Date().getMonth() / 12;
+    for (const set of tradeHistory) {
+      const ownerOf = new Map((set.rosters || []).map(r => [r.roster_id, r.owner_id]));
+      for (const tx of set.txns || []) {
+        if (tx.type !== 'trade' || tx.status !== 'complete') continue;
+        const when = tx.status_updated || tx.created || 0;
+        const yearsAgo = when ? Math.max(0, nowYear - (new Date(when).getFullYear() + new Date(when).getMonth() / 12)) : 0;
+        const sides = {};
+        for (const rid of tx.roster_ids || []) sides[rid] = { got: [], gave: [] };
+        const pl = (id) => {
+          const f = fcById.get(String(id)), sp = sleeperPlayers?.[id] || {};
+          const age = f?.player.maybeAge ?? sp.age;
+          return { kind: 'player', id: String(id), name: f?.player.name || sp.full_name || `Player ${id}`, pos: f?.player.position || sp.position || '?',
+            value: f?.value ?? 0, age: age != null ? +age - yearsAgo : null };
+        };
+        for (const [id, rid] of Object.entries(tx.adds || {})) sides[rid]?.got.push(pl(id));
+        for (const [id, rid] of Object.entries(tx.drops || {})) sides[rid]?.gave.push(pl(id));
+        for (const dp of tx.draft_picks || []) {
+          const pk = { kind: 'pick', name: `${dp.season} round ${dp.round}`, value: pickValue(String(dp.season), dp.round, 'generic'), pos: 'PICK' };
+          sides[dp.owner_id]?.got.push(pk); sides[dp.previous_owner_id]?.gave.push(pk);
+        }
+        const entry = { when, season: set.season, sides: [] };
+        for (const [rid, sd] of Object.entries(sides)) {
+          const team = byOwner.get(ownerOf.get(+rid));
+          entry.sides.push({ team, teamName: team?.name || 'Former manager', ...sd });
+          if (!team) continue;
+          const pr = team.profile;
+          pr.trades++; pr.seasons.add(set.season);
+          pr.piecesIn += sd.got.length; pr.piecesOut += sd.gave.length;
+          for (const a of sd.got) {
+            pr.valIn += a.value;
+            if (a.kind === 'pick') pr.picksIn += a.value;
+            else { pr.posIn[a.pos] = (pr.posIn[a.pos] || 0) + a.value; if (a.age) { pr.ageIn[0] += a.age * a.value; pr.ageIn[1] += a.value; } }
+          }
+          for (const a of sd.gave) {
+            pr.valOut += a.value;
+            if (a.kind === 'pick') pr.picksOut += a.value;
+            else if (a.age) { pr.ageOut[0] += a.age * a.value; pr.ageOut[1] += a.value; }
+          }
+          for (const other of tx.roster_ids || []) if (other !== +rid) {
+            const ot = byOwner.get(ownerOf.get(other));
+            if (ot) pr.partners[ot.name] = (pr.partners[ot.name] || 0) + 1;
+          }
+        }
+        log.push(entry);
+      }
+    }
+    log.sort((a, b) => b.when - a.when);
+    const seasonsTotal = new Set(tradeHistory.map(s => s.season)).size || 1;
+    for (const t of teams) {
+      const pr = t.profile;
+      pr.perSeason = pr.trades / seasonsTotal;
+      pr.pickNet = pr.picksIn - pr.picksOut;
+      pr.consol = pr.trades ? (pr.piecesOut - pr.piecesIn) / pr.trades : 0; // >0: gives more pieces than gets (consolidator)
+      const ai = pr.ageIn[1] ? pr.ageIn[0] / pr.ageIn[1] : null, ao = pr.ageOut[1] ? pr.ageOut[0] / pr.ageOut[1] : null;
+      pr.ageNet = ai != null && ao != null ? ai - ao : 0; // >0: buys older than they sell
+      const posTot = Object.values(pr.posIn).reduce((a, b) => a + b, 0) || 1;
+      pr.posShare = Object.fromEntries(Object.entries(pr.posIn).map(([k, v]) => [k, v / posTot]));
+      const tags = [];
+      if (!pr.trades) tags.push("Hasn't traded");
+      else {
+        if (pr.perSeason >= 3) tags.push('Active trader'); else if (pr.perSeason < 1) tags.push('Rarely trades');
+        if (pr.pickNet > 1500) tags.push('Collects picks'); else if (pr.pickNet < -1500) tags.push('Spends picks');
+        if (pr.consol >= 0.5) tags.push('Consolidates (2-for-1s)'); else if (pr.consol <= -0.5) tags.push('Adds depth (1-for-2s)');
+        if (pr.ageNet >= 1.5) tags.push('Buys veterans'); else if (pr.ageNet <= -1.5) tags.push('Buys youth');
+        const fav = Object.entries(pr.posShare).filter(([k]) => k !== '?').sort((a, b) => b[1] - a[1])[0];
+        if (fav && fav[1] >= 0.45 && pr.trades >= 2) tags.push(`Targets ${fav[0]}s`);
+        const bud = Object.entries(pr.partners).sort((a, b) => b[1] - a[1])[0];
+        if (bud && bud[1] >= 2) tags.push(`Often trades with ${bud[0]}`);
+      }
+      pr.tags = tags;
+      pr.favPos = Object.entries(pr.posShare).filter(([k, v]) => k !== '?' && v >= 0.45 && pr.trades >= 2).map(([k]) => k);
+    }
+    return log;
+  }
+
   function buildModel(input, prefs) {
     const { league, users, rosters, tradedPicks = [], fc = [], sleeperPlayers = null, stats = null, trending = [], myUsername, history = null } = input;
     const hist = summariseHistory(history, prefs.dipWindow ?? 90);
@@ -268,7 +376,9 @@ const ENGINE = (() => {
         age: age != null ? +age : null,
         yoe: f?.player.maybeYoe ?? sp.years_exp ?? null,
         value, now, trend: f?.trend30Day ?? 0,
-        injury: sp.injury_status || null,
+        injury: sp.injury_status || (sp.status === 'Injured Reserve' ? 'IR' : null),
+        injuryBody: sp.injury_body_part || null,
+        injuryNotes: sp.injury_notes || null,
         stats: statMap.get(id) || null,
         adds: trendMap.get(id) || 0,
       });
@@ -343,10 +453,11 @@ const ENGINE = (() => {
         // Buy-low: a dip in a prime-age player whose role is intact. Assume ~60% of the drop comes back.
         p.buyLow = p.dip && (p.age ?? 99) <= 28;
         p.rebound = p.buyLow ? (p.value + (p.peakValue - p.value) * 0.6) * p.ageMult : null;
+        injuryAssess(p);
       }
     }
     for (const p of players.values()) if (!SKILL.includes(p.pos)) {
-      p.breakout = 0; p.signals = {}; p.ageMult = 1; p.future = p.value; p.sell = 0; p.dropPct = 0; p.dipFatigue = 0;
+      p.breakout = 0; p.signals = {}; p.ageMult = 1; p.future = p.value; p.sell = 0; p.dropPct = 0; p.dipFatigue = 0; p.injStash = false;
     }
 
     // ---- Strategy classification ----
@@ -401,7 +512,8 @@ const ENGINE = (() => {
       t.assets = [...t.playerIds.map(id => players.get(id)), ...[...picks.values()].filter(p => p.owner === t.rosterId)];
       t.players = t.assets.filter(a => a.kind === 'player');
     }
-    return { league, slots, season, teams, teamById, players, picks, me, haveStats, haveTrending: trendMap.size > 0, histSpan: hist?.span || 0 };
+    const tradeLog = buildTendencies(input.tradeHistory, teams, { fcById, sleeperPlayers, pickValue });
+    return { league, slots, season, teams, teamById, players, picks, me, haveStats, haveTrending: trendMap.size > 0, histSpan: hist?.span || 0, tradeLog };
   }
 
   const STRAT_W = { winnow: { now: 1.0, fut: 0.25 }, middle: { now: 0.6, fut: 0.6 }, rebuild: { now: 0.12, fut: 1.0 } };
@@ -435,9 +547,11 @@ const ENGINE = (() => {
   // ---- Shared trade evaluator ----
   function makeCtx(model, prefs) {
     const me = model.me;
-    const myAssetScore = a => a.buyLow && prefs.buyLow !== false
-      ? Math.max(a.future, a.rebound) * (1.15 * (0.85 + 0.3 * a.dipFatigue))
-      : a.future * (1 + 0.35 * a.breakout);
+    const myAssetScore = a => {
+      if (a.injStash && prefs.injuryStash !== false) return Math.max(a.future, a.injRebound) * 1.1;
+      if (a.buyLow && prefs.buyLow !== false) return Math.max(a.future, a.rebound) * (1.15 * (0.85 + 0.3 * a.dipFatigue));
+      return a.future * (1 + 0.35 * a.breakout);
+    };
     // A manager whose player dipped recently still anchors to the old price; after a long dip they let go.
     const anchored = a => a.buyLow ? 1 + a.dropPct * (1 - a.dipFatigue) : 1;
     return {
@@ -467,13 +581,32 @@ const ENGINE = (() => {
     res.newStarters = after.filled.filter(([, p]) => gIds.has(p.id)).map(([slot, p]) => [slot, p]);
     res.theirFut = pm(G.map(a => stratFuture(a, t.strategy))) - pm(R.map(a => stratFuture(a, t.strategy) * ctx.anchored(a)));
     res.partnerU = (w.now * res.theirNow + w.fut * res.theirFut) / 1000 - Math.max(0, diff) * 2.5;
+    // Nudge by this manager's trade history
+    const pr = t.profile; res.tendency = [];
+    if (pr?.trades) {
+      let b = 0;
+      const gPl = G.filter(a => a.kind === 'player'), rPl = R.filter(a => a.kind === 'player');
+      const avgAge = l => { const x = l.filter(a => a.age); return x.length ? x.reduce((s, a) => s + a.age, 0) / x.length : null; };
+      if (pr.pickNet > 1500 && G.some(a => a.kind === 'pick')) { b += 0.3; res.tendency.push('they tend to collect picks'); }
+      if (pr.pickNet < -1500 && R.some(a => a.kind === 'pick')) { b += 0.25; res.tendency.push('they tend to spend picks on players'); }
+      if (pr.consol >= 0.5 && G.length < R.length) { b += 0.25; res.tendency.push('they like consolidating into fewer, better pieces'); }
+      if (pr.consol <= -0.5 && G.length > R.length) { b += 0.2; res.tendency.push('they like adding depth'); }
+      const ag = avgAge(gPl), ar = avgAge(rPl);
+      if (ag && ar && pr.ageNet >= 1.5 && ag > ar) { b += 0.2; res.tendency.push('they usually buy proven veterans'); }
+      if (ag && ar && pr.ageNet <= -1.5 && ag < ar) { b += 0.2; res.tendency.push('they usually buy youth'); }
+      const fp = gPl.find(a => pr.favPos.includes(a.pos));
+      if (fp) { b += 0.15; res.tendency.push(`they often trade for ${fp.pos}s`); }
+      res.partnerU += b;
+    }
     const myAfter = me.players.filter(p => !gIds.has(p.id)).concat(R.filter(a => a.kind === 'player'));
     res.myNow = lineupValue(myAfter, model.slots).total - ctx.myLineupBefore;
     res.myFut = pm(R.map(ctx.myAssetScore)) - pm(G.map(a => stratFuture(a, me.strategy)));
     res.myU = (ctx.myStrat.now * res.myNow + ctx.myStrat.fut * res.myFut) / 1000;
     if (res.partnerU <= (opts.minPartner ?? 0.15)) return fail('not enough in it for them');
     if (res.myU <= (opts.minMine ?? 0.2)) return fail('not enough in it for you');
-    res.score = res.myU + 0.6 * Math.min(res.partnerU, 3) - 4 * Math.max(0, Math.abs(diff) - 0.04);
+    // Managers who actually trade are worth more of your time
+    const act = !pr || !model.tradeLog?.length ? 1 : pr.trades === 0 ? 0.85 : clamp(0.92 + 0.06 * pr.perSeason, 0.92, 1.12);
+    res.score = (res.myU + 0.6 * Math.min(res.partnerU, 3) - 4 * Math.max(0, Math.abs(diff) - 0.04)) * act;
     return res;
   }
 
@@ -485,6 +618,7 @@ const ENGINE = (() => {
       if (m === 'shop') return true;
       if (a.kind === 'pick') return !prefs.protectPicks && a.value >= 400;
       if (a.dip) return false; // never sell a star during a situational dip unless marked Shop
+      if (a.injuredOut) return false; // injured players fetch little: don't sell low
       if (a.trendPct <= -0.08) return false; // avoid selling into a falling market
       if (forOffer) return a.value >= 250;
       return a.value >= 600 && (a.sell >= 0.35 || a.ageMult < 0.9);
@@ -500,7 +634,7 @@ const ENGINE = (() => {
     for (const t of model.teams) {
       if (t === me) continue;
       // What I'd want from them: young / breakout / picks / buy-low dips
-      const want = t.assets.filter(a => a.value >= 400 && (a.kind === 'pick' || a.ageMult >= 1 || a.breakout >= 0.45 || (a.buyLow && prefs.buyLow !== false)))
+      const want = t.assets.filter(a => a.value >= 400 && (a.kind === 'pick' || a.ageMult >= 1 || a.breakout >= 0.45 || (a.buyLow && prefs.buyLow !== false) || (a.injStash && prefs.injuryStash !== false)))
         .sort((a, b) => ctx.myAssetScore(b) - ctx.myAssetScore(a)).slice(0, 14);
       const cap = maxPer >= 3 ? 8 : 99;
       const giveSets = combos(give.slice(0, cap), maxPer), getSets = combos(want.slice(0, cap + 2), maxPer);
@@ -580,6 +714,7 @@ const ENGINE = (() => {
     else if (tr.theirFut > 0) why.push(`${t.name} are ${stratName[t.strategy]} (${t.wins}–${t.losses}) and gain long-term value.`);
     for (const a of tr.get) why.push(`You get ${a.name}: ${assetReason(a)}`);
     for (const a of tr.give) if (a.kind === 'player') why.push(`You give ${a.name}: ${sellReason(a)}`);
+    if (tr.tendency?.length) why.push(`Their trade history: ${tr.tendency.join('; ')}.`);
     const pct = Math.round(tr.diff * 100);
     const side = (list, eff) => list.length > 1 ? `${fmt(rawValue(list))} (worth ${fmt(eff)} as a package)` : fmt(eff);
     why.push(`Market check: you give ${side(tr.give, tr.gv)}, you get ${side(tr.get, tr.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${pct}% their way`}).`);
@@ -598,12 +733,18 @@ const ENGINE = (() => {
       if (a.dipDays != null && a.dipDays >= 45) out.push(`${a.name} has been below his peak for ${a.dipDays} days, so his manager may be ready to move on.`);
       else out.push(`${a.name}'s dip is recent, so his manager probably still values him close to his old price. This offer allows for that.`);
     }
+    if (t.strategy !== 'rebuild') for (const a of r.get) if (a.injStash) out.push(`${a.name} is ${a.injury} and won't help them this season, so they may happily swap him for players who score now.`);
+    if (r.tendency?.length) out.push(`Their trade history: ${r.tendency.join('; ')}.`);
     const pct = Math.round(r.diff * 100);
     out.push(`Market: you give ${r.give.length > 1 ? fmt(rawValue(r.give)) + ' (worth ' + fmt(r.gv) + ' as a package)' : fmt(r.gv)} for ${fmt(r.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${-pct}% over market, paid by you`}).`);
     return out;
   }
 
   function assetReason(a) {
+    if (a.injStash) {
+      return `injury stash: ${a.injury}${a.injuryBody ? ` (${a.injuryBody})` : ''}, so he's worth little to a contender this season and his price is down. ` +
+        `At ${Math.floor(a.age)} with a ${a.injSeverity} injury, his recovery outlook is good (we estimate ${Math.round(a.injRecovery * 100)}% of his old value comes back).`;
+    }
     if (a.buyLow) {
       const b = [a.dipDays != null
         ? `buy low: ${Math.round(a.dropPct * 100)}% below his ${fmt(a.peakValue)} peak, and has been for ${a.dipDays} days`
@@ -686,6 +827,35 @@ async function cached(key, maxAgeMs, loader) {
 }
 const soft = p => p.catch(e => { console.warn(e); return null; });
 
+async function loadTradeHistory(league, currentWeek) {
+  const out = [];
+  const weeksFor = (lg, isCurrent) => {
+    const last = isCurrent ? Math.min(18, Math.max(1, (currentWeek || 18) + 1)) : 18;
+    return Array.from({ length: last + 1 }, (_, i) => i); // week 0 = offseason trades
+  };
+  const fetchTxns = async (lg, isCurrent) => {
+    const weeks = weeksFor(lg, isCurrent);
+    const lists = await Promise.all(weeks.map(w => getJSON(`${SLEEPER}/league/${lg.league_id}/transactions/${w}`).catch(() => [])));
+    return lists.flat().filter(t => t && t.type === 'trade');
+  };
+  const [curRosters, curTx] = [RAW_ROSTERS, await fetchTxns(league, true)];
+  out.push({ season: league.season, rosters: curRosters, txns: curTx });
+  let prevId = league.previous_league_id, hops = 0;
+  while (prevId && prevId !== '0' && hops < 3) {
+    hops++;
+    const id = prevId;
+    const set = await cached(`hist:${id}`, 30 * 86400000, async () => {
+      const lg = await getJSON(`${SLEEPER}/league/${id}`);
+      const [rosters, txns] = await Promise.all([getJSON(`${SLEEPER}/league/${id}/rosters`), fetchTxns(lg, false)]);
+      return { season: lg.season, prev: lg.previous_league_id, rosters: rosters.map(r => ({ roster_id: r.roster_id, owner_id: r.owner_id })), txns };
+    }).catch(() => null);
+    if (!set) break;
+    out.push(set); prevId = set.prev;
+  }
+  return out;
+}
+let RAW_ROSTERS = [];
+
 async function load(force) {
   status('Fetching Sleeper and FantasyCalc…');
   try {
@@ -702,16 +872,18 @@ async function load(force) {
       getJSON(fcUrl).catch(e => { throw new Error('FantasyCalc values failed to load (' + e.message + ')'); }),
       soft(getJSON(`${SLEEPER}/players/nfl/trending/add?lookback_hours=72&limit=200`)),
     ]);
-    status('Loading player details and season stats…');
+    status('Loading player details, season stats and trade history…');
+    RAW_ROSTERS = rosters.map(r => ({ roster_id: r.roster_id, owner_id: r.owner_id }));
     const season = nfl?.season || league.season;
-    const [sleeperPlayers, stats, history] = await Promise.all([
+    const [sleeperPlayers, stats, history, tradeHistory] = await Promise.all([
       soft(force ? getJSON(`${SLEEPER}/players/nfl`) : cached('players', 86400000, () => getJSON(`${SLEEPER}/players/nfl`))),
       soft(getJSON(`${SLEEPER}/stats/nfl/regular/${season}`).catch(() => getJSON(`https://api.sleeper.com/stats/nfl/${season}?season_type=regular`))),
       soft(fetch('data/history.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
+      soft(loadTradeHistory(league, nfl?.week)),
     ]);
-    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history };
+    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory };
     rebuild();
-    const missing = [!stats && 'season stats', !trending && 'trending adds', !sleeperPlayers && 'player details'].filter(Boolean);
+    const missing = [!tradeHistory && 'trade history', !stats && 'season stats', !trending && 'trending adds', !sleeperPlayers && 'player details'].filter(Boolean);
     status(`Updated ${new Date().toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` + (missing.length ? ` · couldn't load ${missing.join(', ')}, so those signals are skipped` : ''));
   } catch (e) {
     console.error(e);
@@ -735,7 +907,7 @@ function renderTrades() {
   if (!trades.length) { el.innerHTML = `<div class="card">No trades pass the filters right now. Try widening the fairness range or marking more players as "Shop" in My team.</div>`; return; }
   el.innerHTML = `<p class="small">Ranked by how much each deal helps your rebuild, with a check that the other side would want it too. Values are FantasyCalc dynasty values for your format.</p>` +
     trades.map((tr, i) => {
-      const side = (title, list) => `<div class="side"><h4>${title}</h4>${list.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}${a.buyLow && tr.get.includes(a) ? '<span class="tag buy">buy low</span>' : a.breakout >= 0.55 && a.kind === 'player' ? '<span class="tag hot">breakout</span>' : ''}</div><div class="meta">${esc(assetMeta(a))}</div></div><div class="val">${fmt(a.value)}</div></div>`).join('')}</div>`;
+      const side = (title, list) => `<div class="side"><h4>${title}</h4>${list.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}${a.injStash && tr.get.includes(a) ? '<span class="tag hot">injury stash</span>' : a.buyLow && tr.get.includes(a) ? '<span class="tag buy">buy low</span>' : a.breakout >= 0.55 && a.kind === 'player' ? '<span class="tag hot">breakout</span>' : ''}</div><div class="meta">${esc(assetMeta(a))}</div></div><div class="val">${fmt(a.value)}</div></div>`).join('')}</div>`;
       const d = Math.max(-0.3, Math.min(0.3, tr.diff));
       const left = 50 + (d / 0.3) * 50;
       const color = Math.abs(tr.diff) <= 0.06 ? 'var(--good)' : 'var(--warn)';
@@ -771,7 +943,17 @@ function renderTargets() {
     <td class="n">${fmt(p.value)}</td><td class="n">${lenCell(p)}</td>
     ${s ? `<td class="n">${p.snapShare ? Math.round(p.snapShare * 100) + '%' : '–'}</td>` : ''}</tr>`).join('')}
   </tbody></table></div>` : `<div class="card small">No role-intact dips right now. Every prime-age player who has lost value has also lost snaps or targets.</div>`}`;
-  $('#tab-targets').innerHTML = dipHtml + `<h3 style="margin:18px 0 4px;font-size:16px">Breakout targets</h3><p class="small">Players on other rosters with the strongest breakout signals: youth, ${s ? 'usage, production ahead of value, ' : ''}Sleeper trending adds and 30-day value momentum.</p>
+  const inj = [...MODEL.players.values()].filter(p => p.owner !== MODEL.me.rosterId && p.injStash)
+    .sort((a, b) => (b.injRebound - b.value) - (a.injRebound - a.value));
+  const injHtml = `<h3 style="margin:18px 0 4px;font-size:16px">Injury stashes</h3>
+  <p class="small">Young players (26 or under) who are out or on IR and score nothing for their team right now, but have a good chance of getting back to their old level. Contenders often sell these cheaply. Tap a player to see offers.</p>
+  ${inj.length ? `<div class="card scroll"><table><thead><tr><th>Player</th><th>Owner</th><th class="n">Value</th><th>Injury</th></tr></thead><tbody>
+  ${inj.map(p => `<tr class="tap" data-id="${esc(p.id)}"><td><b>${esc(p.name)}</b><span class="tag hot">stash</span><div class="small">${esc(assetMeta(p))}</div></td>
+    <td class="small">${esc(ownerName(p.owner))}<br>${stratPill(MODEL.teamById.get(p.owner))}</td>
+    <td class="n">${fmt(p.value)}<div class="small" style="color:var(--good)">→ ${fmt(p.injRebound / p.ageMult)}</div></td>
+    <td class="small">${esc(p.injury)}${p.injuryBody ? ' · ' + esc(p.injuryBody) : ''}<br>${esc(p.injSeverity)} · ${Math.round(p.injRecovery * 100)}% recovery</td></tr>`).join('')}
+  </tbody></table><p class="small">"→" is roughly what he'd be worth once healthy and producing again.</p></div>` : `<div class="card small">No young players on other teams are currently out with an injury they're expected to recover from.</div>`}`;
+  $('#tab-targets').innerHTML = dipHtml + injHtml + `<h3 style="margin:18px 0 4px;font-size:16px">Breakout targets</h3><p class="small">Players on other rosters with the strongest breakout signals: youth, ${s ? 'usage, production ahead of value, ' : ''}Sleeper trending adds and 30-day value momentum.</p>
   <div class="card scroll"><table><thead><tr><th>Player</th><th>Owner</th><th class="n">Value</th>${s ? '<th class="n">PPG</th>' : ''}<th class="n">Adds</th><th>Score</th></tr></thead><tbody>
   ${list.map(p => `<tr class="tap" data-id="${esc(p.id)}"><td><b>${esc(p.name)}</b><div class="small">${esc(assetMeta(p))}${p.ppgRank && p.valRank ? ` · scoring ${p.pos}${p.ppgRank}, valued ${p.pos}${p.valRank}` : ''}</div></td>
     <td class="small">${esc(ownerName(p.owner))}<br>${stratPill(MODEL.teamById.get(p.owner))}</td><td class="n">${fmt(p.value)}${p.trend ? `<div class="small" style="color:${p.trend > 0 ? 'var(--good)' : 'var(--bad)'}">${p.trend > 0 ? '+' : ''}${fmt(p.trend)}</div>` : ''}</td>
@@ -820,7 +1002,8 @@ function renderMyTeam() {
   const tags = a => {
     if (a.kind === 'pick') return '';
     let t = '';
-    if (a.dip) t += '<span class="tag buy" title="Value down but role intact: hold, don\'t sell low">dip · hold</span>';
+    if (a.injuredOut) t += `<span class="tag hot">${esc(a.injury)} · hold</span>`;
+    else if (a.dip) t += '<span class="tag buy" title="Value down but role intact: hold, don\'t sell low">dip · hold</span>';
     else if (a.sell >= 0.45) t += '<span class="tag sell">sell high</span>';
     if (a.breakout >= 0.55) t += '<span class="tag buy">core</span>';
     if (starters.has(a.id)) t += '<span class="tag">starter</span>';
@@ -846,6 +1029,15 @@ function renderLeague() {
     <td class="n">${t.wins}–${t.losses}</td><td class="n">${fmt(t.lineupNow)}</td><td class="n">${t.avgAge ? t.avgAge.toFixed(1) : '–'}</td>
     <td><select data-r="${t.rosterId}">${['winnow', 'middle', 'rebuild'].map(s => `<option value="${s}" ${t.strategy === s ? 'selected' : ''}>${label(s)}${s === t.autoStrategy && t !== MODEL.me ? ' (auto)' : ''}</option>`).join('')}</select></td></tr>`).join('')}
   </tbody></table><p class="small">"Lineup" is this season's value of each team's best possible starting lineup. "Roster age" is weighted by value.</p></div>`;
+  const log = MODEL.tradeLog || [];
+  const seasons = [...new Set(log.map(e => e.season))];
+  const profHtml = `<h3 style="margin:18px 0 4px;font-size:16px">Manager trade tendencies</h3>
+  <p class="small">${log.length ? `From ${log.length} completed trade${log.length === 1 ? '' : 's'} (${seasons.join(', ')}). These tendencies feed into the trade scores, and managers who trade more often rank a little higher. Values are today's, so they show what kind of assets moved, not what they were worth at the time.` : 'No completed trades found in this league yet. Profiles will fill in as trades happen.'}</p>
+  ${log.length ? `<div class="card">${MODEL.teams.slice().sort((a, b) => b.profile.trades - a.profile.trades).map(t => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(t.name)}</b>${t === MODEL.me ? ' <span class="tag buy">you</span>' : ''} <span class="small">· ${t.profile.trades} trade${t.profile.trades === 1 ? '' : 's'}</span><div>${t.profile.tags.map(g => `<span class="pill" style="margin:3px 4px 0 0">${esc(g)}</span>`).join('')}</div></div>`).join('')}</div>
+  <h3 style="margin:18px 0 4px;font-size:16px">Recent trades</h3>
+  ${log.slice(0, 12).map(e => `<div class="card"><div class="small" style="margin-bottom:6px">${e.when ? new Date(e.when).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : e.season}</div>
+    <div class="sides">${e.sides.map(sd => `<div class="side"><h4>${esc(sd.teamName)} got</h4>${sd.got.length ? sd.got.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}</div><div class="meta">${a.kind === 'pick' ? 'Draft pick' : esc(a.pos) + (a.age ? ' · ' + Math.floor(a.age) + ' then' : '')}</div></div><div class="val">${fmt(a.value)}</div></div>`).join('') : '<div class="small">Nothing</div>'}</div>`).join('')}</div></div>`).join('')}` : ''}`;
+  $('#tab-league').insertAdjacentHTML('beforeend', profHtml);
   $('#tab-league').querySelectorAll('select').forEach(s => s.onchange = () => { prefs.strategy[s.dataset.r] = s.value; savePrefs(); rebuild(); });
 }
 
@@ -856,6 +1048,7 @@ function renderSettings() {
     <label class="set"><span>Max assets per side</span>
       <select id="s-max">${[1, 2, 3].map(v => `<option ${prefs.maxAssets == v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
     <label class="set"><span>Target buy-low dips<div class="small">Prime-age stars whose value has dropped while their role hasn't</div></span><input type="checkbox" id="s-buylow" ${prefs.buyLow !== false ? 'checked' : ''}></label>
+    <label class="set"><span>Target injury stashes<div class="small">Young injured players with a good recovery outlook</div></span><input type="checkbox" id="s-inj" ${prefs.injuryStash !== false ? 'checked' : ''}></label>
     <label class="set"><span>Buy-low look-back<div class="small">Dips are measured from each player's peak in this window (needs saved history)</div></span>
       <select id="s-win">${[60, 90, 120].map(v => `<option value="${v}" ${(prefs.dipWindow ?? 90) == v ? 'selected' : ''}>${v} days</option>`).join('')}</select></label>
     <label class="set"><span>Never trade away my picks</span><input type="checkbox" id="s-picks" ${prefs.protectPicks ? 'checked' : ''}></label>
@@ -866,6 +1059,7 @@ function renderSettings() {
   </div>`;
   $('#s-fair').onchange = e => { prefs.fairness = +e.target.value; savePrefs(); rebuild(); };
   $('#s-max').onchange = e => { prefs.maxAssets = +e.target.value; savePrefs(); rebuild(); };
+  $('#s-inj').onchange = e => { prefs.injuryStash = e.target.checked; savePrefs(); rebuild(); };
   $('#s-win').onchange = e => { prefs.dipWindow = +e.target.value; savePrefs(); rebuild(); };
   $('#s-buylow').onchange = e => { prefs.buyLow = e.target.checked; savePrefs(); rebuild(); };
   $('#s-picks').onchange = e => { prefs.protectPicks = e.target.checked; savePrefs(); rebuild(); };
