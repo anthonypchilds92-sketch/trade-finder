@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trade Finder · Futures Past + Present</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#171b21; --panel2:#1e232b; --line:#2a313b;
+    --text:#e8ebef; --muted:#9aa4b1; --accent:#4fb3ff; --good:#3ecf8e; --warn:#f2b84b; --bad:#ff6b6b;
+    --chip:#232a33;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif}
+  header{position:sticky;top:0;z-index:5;background:rgba(15,18,22,.95);backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+  .wrap{max-width:980px;margin:0 auto;padding:12px 14px}
+  h1{font-size:18px;margin:0}
+  .sub{color:var(--muted);font-size:13px}
+  nav{display:flex;gap:6px;overflow-x:auto;padding-top:10px}
+  nav button{flex:0 0 auto;background:var(--chip);color:var(--text);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:14px;cursor:pointer}
+  nav button.on{background:var(--accent);color:#06121d;border-color:var(--accent);font-weight:600}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .btn{background:var(--accent);color:#06121d;border:0;border-radius:8px;padding:7px 12px;font-weight:600;cursor:pointer;font-size:14px}
+  .btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin:10px 0}
+  .trade-top{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}
+  .partner{font-weight:600}
+  .pill{display:inline-block;font-size:12px;padding:2px 8px;border-radius:999px;background:var(--chip);border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+  .pill.winnow{color:var(--warn);border-color:#5a4a26}
+  .pill.rebuild{color:var(--good);border-color:#24503d}
+  .pill.middle{color:var(--accent);border-color:#264a63}
+  .sides{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  @media (max-width:560px){.sides{grid-template-columns:1fr}}
+  .side{background:var(--panel2);border-radius:10px;padding:10px}
+  .side h4{margin:0 0 6px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+  .asset{display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-top:1px dashed #2a313b}
+  .asset:first-of-type{border-top:0}
+  .asset .nm{font-weight:600}
+  .asset .meta{color:var(--muted);font-size:12px}
+  .val{font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px;text-align:right;white-space:nowrap}
+  .meter{height:6px;background:var(--chip);border-radius:6px;position:relative;margin:10px 0 4px}
+  .meter i{position:absolute;top:-3px;width:2px;height:12px;background:var(--text)}
+  .meter b{position:absolute;top:0;height:6px;border-radius:6px}
+  ul.why{margin:8px 0 0;padding-left:18px;color:#cfd6de;font-size:13.5px}
+  ul.why li{margin:2px 0}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{padding:7px 6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+  th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+  .scroll{overflow-x:auto}
+  select,input,textarea{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font:inherit;font-size:14px}
+  textarea{width:100%;min-height:120px}
+  .tag{font-size:11px;padding:1px 6px;border-radius:6px;margin-left:4px;background:var(--chip);color:var(--muted)}
+  .tag.sell{color:var(--warn)} .tag.buy{color:var(--good)} .tag.hot{color:#ff8fd0}
+  .status{font-size:13px;color:var(--muted)}
+  .err{color:var(--bad)}
+  .hidden{display:none}
+  .bar{height:5px;background:var(--chip);border-radius:4px;overflow:hidden;min-width:60px}
+  .bar span{display:block;height:100%;background:var(--good)}
+  label.set{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
+  .seg button{background:var(--chip);border:1px solid var(--line);color:var(--muted);padding:3px 8px;font-size:12px;cursor:pointer}
+  .seg button:first-child{border-radius:6px 0 0 6px}.seg button:last-child{border-radius:0 6px 6px 0}
+  .seg button.on{color:#06121d;background:var(--accent);border-color:var(--accent)}
+  .small{font-size:12px;color:var(--muted)}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="row" style="justify-content:space-between">
+      <div>
+        <h1 id="title">Trade Finder</h1>
+        <div class="sub" id="subtitle">Loading league…</div>
+      </div>
+      <button class="btn ghost" id="refresh">Refresh</button>
+    </div>
+    <nav id="tabs">
+      <button data-tab="trades" class="on">Top trades</button>
+      <button data-tab="targets">Breakout targets</button>
+      <button data-tab="myteam">My team</button>
+      <button data-tab="league">League</button>
+      <button data-tab="settings">Settings</button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="status" id="status">Fetching Sleeper and FantasyCalc…</div>
+
+  <section id="tab-trades"></section>
+  <section id="tab-targets" class="hidden"></section>
+  <section id="tab-myteam" class="hidden"></section>
+  <section id="tab-league" class="hidden"></section>
+  <section id="tab-settings" class="hidden"></section>
+</main>
+
+<script>
+/*ENGINE-START*/
+// ---------- Pure trade engine (no DOM) ----------
+const ENGINE = (() => {
+
+  const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+  const FLEX_ELIG = {
+    FLEX: ['RB', 'WR', 'TE'], SUPER_FLEX: ['QB', 'RB', 'WR', 'TE'],
+    REC_FLEX: ['WR', 'TE'], WRRB_FLEX: ['RB', 'WR'],
+  };
+  const SKILL = ['QB', 'RB', 'WR', 'TE'];
+
+  // Two-year age-curve multiplier: how much of today's value a player is likely to keep.
+  function ageMult(pos, age) {
+    if (age == null || isNaN(age)) return 1;
+    const a = Math.floor(age);
+    const t = {
+      RB: [[23, 1.15], [24, 1.05], [25, 0.92], [26, 0.78], [27, 0.62], [28, 0.5], [99, 0.4]],
+      WR: [[23, 1.15], [25, 1.08], [26, 1.0], [27, 0.92], [28, 0.82], [29, 0.7], [30, 0.58], [99, 0.45]],
+      TE: [[24, 1.15], [27, 1.05], [28, 0.93], [29, 0.82], [30, 0.7], [99, 0.55]],
+      QB: [[25, 1.12], [29, 1.05], [32, 0.96], [33, 0.86], [34, 0.76], [99, 0.6]],
+    }[pos];
+    if (!t) return 1;
+    for (const [lim, m] of t) if (a <= lim) return m;
+    return 1;
+  }
+
+  // Parse FantasyCalc pick names like "2027 1st", "2027 Round 1", "2027 Early 1st", "2027 Pick 1.05"
+  function parsePick(name) {
+    const y = (name.match(/\b(20\d\d)\b/) || [])[1];
+    if (!y) return null;
+    let round = null, tier = 'generic', m;
+    if ((m = name.match(/Pick\s*(\d)\.(\d{1,2})/i))) {
+      round = +m[1]; const slot = +m[2];
+      tier = slot <= 4 ? 'early' : slot <= 8 ? 'mid' : 'late';
+    } else if ((m = name.match(/(\d)(?:st|nd|rd|th)\b/i)) || (m = name.match(/Round\s*(\d)/i))) {
+      round = +m[1];
+      if (/early/i.test(name)) tier = 'early'; else if (/mid/i.test(name)) tier = 'mid'; else if (/late/i.test(name)) tier = 'late';
+    }
+    if (!round) return null;
+    return { season: y, round, tier };
+  }
+
+  const DEFAULT_PICK = { 1: 3600, 2: 1700, 3: 900, 4: 500, 5: 300 };
+
+  function buildPickTable(fcRows) {
+    const t = {}; // season -> round -> {early:[],mid:[],late:[],generic:[]}
+    for (const r of fcRows) {
+      if (r.player.position !== 'PICK') continue;
+      const p = parsePick(r.player.name);
+      if (!p) continue;
+      t[p.season] ??= {}; t[p.season][p.round] ??= { early: [], mid: [], late: [], generic: [] };
+      t[p.season][p.round][p.tier].push(r.value);
+    }
+    const avg = a => a.length ? a.reduce((s, x) => s + x, 0) / a.length : null;
+    return function pickValue(season, round, tier) {
+      const r = t[season]?.[round];
+      if (r) {
+        const exact = avg(r[tier] || []);
+        if (exact) return exact;
+        const all = [...r.early, ...r.mid, ...r.late];
+        const g = avg(r.generic) ?? avg(all);
+        if (g) return tier === 'early' ? g * 1.2 : tier === 'late' ? g * 0.82 : g;
+      }
+      // fall back: nearest season in table, else defaults; future years discounted slightly
+      const seasons = Object.keys(t).sort();
+      for (const s of seasons) if (t[s][round]) {
+        const r2 = t[s][round]; const g = avg([...r2.generic, ...r2.early, ...r2.mid, ...r2.late]);
+        if (g) return g * (tier === 'early' ? 1.2 : tier === 'late' ? 0.82 : 1);
+      }
+      return (DEFAULT_PICK[round] || 200) * (tier === 'early' ? 1.2 : tier === 'late' ? 0.82 : 1);
+    };
+  }
+
+  // Best possible starting lineup value for a set of players.
+  function lineupValue(players, slots, key = 'now') {
+    const pool = players.filter(p => SKILL.includes(p.pos)).slice().sort((a, b) => b[key] - a[key]);
+    const used = new Set(); let total = 0; const filled = [];
+    const dedicated = slots.filter(s => SKILL.includes(s));
+    const flex = slots.filter(s => FLEX_ELIG[s]).sort((a, b) => FLEX_ELIG[a].length - FLEX_ELIG[b].length);
+    for (const s of dedicated) {
+      const p = pool.find(x => !used.has(x.id) && x.pos === s);
+      if (p) { used.add(p.id); total += p[key]; filled.push([s, p]); }
+    }
+    for (const s of flex) {
+      const p = pool.find(x => !used.has(x.id) && FLEX_ELIG[s].includes(x.pos));
+      if (p) { used.add(p.id); total += p[key]; filled.push([s, p]); }
+    }
+    return { total, starters: used, filled };
+  }
+
+  function percentileMap(entries) { // entries: [id, number]
+    const sorted = entries.slice().sort((a, b) => a[1] - b[1]);
+    const m = new Map(); const n = sorted.length;
+    sorted.forEach(([id], i) => m.set(id, n > 1 ? i / (n - 1) : 0.5));
+    return m;
+  }
+
+  function normaliseStats(raw) {
+    // Accept v1 object {id: {...}} or array [{player_id, stats:{...}}]
+    const out = new Map();
+    if (!raw) return out;
+    if (Array.isArray(raw)) { for (const r of raw) if (r && r.player_id) out.set(String(r.player_id), r.stats || r); }
+    else for (const [id, s] of Object.entries(raw)) out.set(String(id), s);
+    return out;
+  }
+
+  function buildModel(input, prefs) {
+    const { league, users, rosters, tradedPicks = [], fc = [], sleeperPlayers = null, stats = null, trending = [], myUsername } = input;
+    const slots = (league.roster_positions || []).filter(s => SKILL.includes(s) || FLEX_ELIG[s]);
+    const season = +league.season;
+    const draftRounds = league.settings?.draft_rounds || 4;
+
+    const fcById = new Map();
+    for (const r of fc) if (r.player?.sleeperId) fcById.set(String(r.player.sleeperId), r);
+    const pickValue = buildPickTable(fc);
+    const statMap = normaliseStats(stats);
+    const trendMap = new Map((trending || []).map(t => [String(t.player_id), t.count]));
+    const maxTrend = Math.max(1, ...trendMap.values());
+
+    const userById = new Map(users.map(u => [u.user_id, u]));
+    const teams = rosters.map(r => {
+      const u = userById.get(r.owner_id) || {};
+      const s = r.settings || {};
+      return {
+        rosterId: r.roster_id, ownerId: r.owner_id,
+        username: u.display_name || 'Unknown',
+        name: u.metadata?.team_name || u.display_name || `Team ${r.roster_id}`,
+        wins: s.wins || 0, losses: s.losses || 0, ties: s.ties || 0,
+        pf: (s.fpts || 0) + (s.fpts_decimal || 0) / 100,
+        pa: (s.fpts_against || 0) + (s.fpts_against_decimal || 0) / 100,
+        playerIds: (r.players || []).map(String),
+        assets: [],
+      };
+    });
+    const teamById = new Map(teams.map(t => [t.rosterId, t]));
+
+    // ---- Players ----
+    const players = new Map();
+    for (const t of teams) for (const id of t.playerIds) {
+      const f = fcById.get(id); const sp = sleeperPlayers?.[id] || {};
+      const pos = f?.player.position || sp.position || '?';
+      const age = f?.player.maybeAge ?? sp.age ?? null;
+      const value = f?.value ?? 0;
+      const now = f?.redraftValue ?? value * 0.55;
+      players.set(id, {
+        id, kind: 'player', owner: t.rosterId,
+        name: f?.player.name || sp.full_name || (sp.first_name ? `${sp.first_name} ${sp.last_name}` : `Player ${id}`),
+        pos, team: f?.player.maybeTeam || sp.team || 'FA',
+        age: age != null ? +age : null,
+        yoe: f?.player.maybeYoe ?? sp.years_exp ?? null,
+        value, now, trend: f?.trend30Day ?? 0,
+        injury: sp.injury_status || null,
+        stats: statMap.get(id) || null,
+        adds: trendMap.get(id) || 0,
+      });
+    }
+
+    // ---- Breakout signals (computed league-wide by position) ----
+    const byPos = {};
+    for (const p of players.values()) if (SKILL.includes(p.pos)) (byPos[p.pos] ??= []).push(p);
+    const haveStats = statMap.size > 0;
+    for (const [pos, list] of Object.entries(byPos)) {
+      const withGames = list.filter(p => p.stats && (p.stats.gp || 0) >= 3);
+      const ppg = p => (p.stats.pts_half_ppr ?? p.stats.pts_ppr ?? 0) / Math.max(1, p.stats.gp);
+      const opp = p => {
+        const s = p.stats, gp = Math.max(1, s.gp);
+        if (pos === 'QB') return ((s.pass_att || 0) + 1.5 * (s.rush_att || 0)) / gp;
+        if (pos === 'RB') return ((s.rush_att || 0) + 1.6 * (s.rec_tgt || 0)) / gp;
+        return (s.rec_tgt || 0) / gp;
+      };
+      const snap = p => p.stats.tm_off_snp ? (p.stats.off_snp || 0) / p.stats.tm_off_snp : null;
+      const oppPct = percentileMap(withGames.map(p => [p.id, opp(p)]));
+      const snapPct = percentileMap(withGames.filter(p => snap(p) != null).map(p => [p.id, snap(p)]));
+      const ppgRank = new Map(withGames.slice().sort((a, b) => ppg(b) - ppg(a)).map((p, i) => [p.id, i + 1]));
+      const valRank = new Map(withGames.slice().sort((a, b) => b.value - a.value).map((p, i) => [p.id, i + 1]));
+      for (const p of list) {
+        const sig = {};
+        const yoe = p.yoe ?? 5;
+        sig.youth = ([1, 0.85, 0.6, 0.3][yoe] ?? 0) * ((p.age ?? 30) <= 25 ? 1 : 0.5);
+        if (haveStats && p.stats && (p.stats.gp || 0) >= 3) {
+          const u = 0.65 * (oppPct.get(p.id) ?? 0) + 0.35 * (snapPct.get(p.id) ?? oppPct.get(p.id) ?? 0);
+          sig.usage = u;
+          const gap = valRank.get(p.id) - ppgRank.get(p.id);
+          sig.underval = clamp(gap / 20);
+          p.ppg = ppg(p); p.ppgRank = ppgRank.get(p.id); p.valRank = valRank.get(p.id);
+          p.oppPerGame = opp(p); p.snapShare = snap(p);
+        } else if (haveStats) { sig.usage = 0; sig.underval = 0; }
+        sig.buzz = p.adds ? Math.log1p(p.adds) / Math.log1p(maxTrend) : 0;
+        const base = Math.max(1, p.value - p.trend);
+        sig.momentum = clamp((p.trend / base) / 0.2);
+        const W = { youth: 0.25, usage: 0.25, underval: 0.25, buzz: 0.15, momentum: 0.10 };
+        let tot = 0, w = 0;
+        for (const k of Object.keys(W)) if (sig[k] != null) { tot += W[k] * sig[k]; w += W[k]; }
+        p.signals = sig;
+        p.breakout = w ? tot / w : 0;
+        // Breakouts only matter if there is some real value or role to grow from
+        if (p.value < 300 && !(sig.usage > 0.6)) p.breakout *= 0.5;
+        p.ageMult = ageMult(p.pos, p.age);
+        p.future = p.value * p.ageMult;
+        const decline = clamp((1 - p.ageMult) / 0.5);
+        const nowRatio = clamp((p.now / Math.max(1, p.value) - 0.45) / 0.5);
+        const negTrend = clamp(-p.trend / Math.max(1, p.value) / 0.15);
+        p.sell = 0.55 * decline + 0.3 * nowRatio + 0.15 * negTrend;
+      }
+    }
+    for (const p of players.values()) if (!SKILL.includes(p.pos)) {
+      p.breakout = 0; p.signals = {}; p.ageMult = 1; p.future = p.value; p.sell = 0;
+    }
+
+    // ---- Strategy classification ----
+    for (const t of teams) {
+      const ps = t.playerIds.map(id => players.get(id)).filter(Boolean);
+      t.lineupNow = lineupValue(ps, slots, 'now').total;
+      t.futureTotal = ps.reduce((s, p) => s + p.future, 0);
+      const vsum = ps.reduce((s, p) => s + p.value, 0) || 1;
+      t.avgAge = ps.filter(p => p.age).reduce((s, p) => s + p.age * p.value, 0) / vsum;
+      t.games = t.wins + t.losses + t.ties;
+      t.winPct = t.games ? (t.wins + 0.5 * t.ties) / t.games : 0.5;
+    }
+    const z = (arr, f) => { const v = arr.map(f); const m = v.reduce((a, b) => a + b, 0) / v.length; const sd = Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length) || 1; return x => (f(x) - m) / sd; };
+    const zL = z(teams, t => t.lineupNow), zW = z(teams, t => t.winPct), zP = z(teams, t => t.pf);
+    for (const t of teams) t.contendScore = 0.5 * zL(t) + 0.3 * zW(t) + 0.2 * zP(t);
+    const ranked = teams.slice().sort((a, b) => b.contendScore - a.contendScore);
+    const n = teams.length, topN = Math.round(n * 0.4), botN = Math.round(n * 0.3);
+    ranked.forEach((t, i) => {
+      t.contendRank = i + 1;
+      t.autoStrategy = i < topN ? 'winnow' : i >= n - botN ? 'rebuild' : 'middle';
+    });
+    const me = teams.find(t => t.username.toLowerCase() === (myUsername || '').toLowerCase()) || teams[0];
+    for (const t of teams) {
+      const o = prefs.strategy?.[t.rosterId];
+      t.strategy = o || (t === me ? 'rebuild' : t.autoStrategy);
+    }
+
+    // ---- Draft picks ----
+    const seasons = [season + 1, season + 2, season + 3].map(String);
+    const pickOwner = new Map();
+    for (const s of seasons) for (let r = 1; r <= draftRounds; r++) for (const t of teams) pickOwner.set(`${s}:${r}:${t.rosterId}`, t.rosterId);
+    for (const tp of tradedPicks) {
+      const k = `${tp.season}:${tp.round}:${tp.roster_id}`;
+      if (pickOwner.has(k)) pickOwner.set(k, tp.owner_id);
+    }
+    const picks = new Map();
+    for (const [k, owner] of pickOwner) {
+      const [s, r, orig] = k.split(':');
+      const origTeam = teamById.get(+orig);
+      let tier = 'generic';
+      if (s === seasons[0]) tier = origTeam.contendRank > n - Math.round(n * 0.3) ? 'early' : origTeam.contendRank <= Math.round(n * 0.3) ? 'late' : 'mid';
+      const value = pickValue(s, +r, tier) * (s === seasons[2] ? 0.95 : 1);
+      const ord = ['', '1st', '2nd', '3rd', '4th', '5th'][+r] || `R${r}`;
+      const label = `${s} ${tier !== 'generic' ? tier[0].toUpperCase() + tier.slice(1) + ' ' : ''}${ord}` + (+orig !== owner ? ` (from ${origTeam.name})` : '');
+      picks.set(`pick:${k}`, {
+        id: `pick:${k}`, kind: 'pick', owner, name: label, pos: 'PICK', season: s, round: +r, origRoster: +orig,
+        value, now: 0, future: value * 1.05, age: null, ageMult: 1, breakout: +r === 1 ? 0.35 : 0.15, sell: 0, trend: 0, signals: {},
+      });
+    }
+
+    for (const t of teams) {
+      t.assets = [...t.playerIds.map(id => players.get(id)), ...[...picks.values()].filter(p => p.owner === t.rosterId)];
+      t.players = t.assets.filter(a => a.kind === 'player');
+    }
+    return { league, slots, season, teams, teamById, players, picks, me, haveStats, haveTrending: trendMap.size > 0 };
+  }
+
+  const STRAT_W = { winnow: { now: 1.0, fut: 0.25 }, middle: { now: 0.6, fut: 0.6 }, rebuild: { now: 0.12, fut: 1.0 } };
+
+  // Market value of a package: extra pieces are discounted (consolidation premium for the best asset)
+  function packageValue(assets) {
+    return assets.map(a => a.value).sort((a, b) => b - a).reduce((s, v, i) => s + v * Math.pow(0.82, i), 0);
+  }
+
+  function generateTrades(model, prefs) {
+    const tol = prefs.fairness ?? 0.12;
+    const maxPer = prefs.maxAssets ?? 2;
+    const me = model.me;
+    const mark = prefs.marks || {};
+    const myPlayersBefore = me.players;
+    const myLineupBefore = lineupValue(myPlayersBefore, model.slots).total;
+
+    // What I'd shop: sell candidates (old / peaked), plus anything marked "shop". Picks only if allowed.
+    let give = me.assets.filter(a => {
+      const m = mark[a.id];
+      if (m === 'protect') return false;
+      if (m === 'shop') return true;
+      if (a.kind === 'pick') return !prefs.protectPicks && a.value >= 400;
+      return a.value >= 600 && (a.sell >= 0.35 || a.ageMult < 0.9);
+    }).sort((a, b) => (b.sell * b.value) - (a.sell * a.value)).slice(0, 12);
+
+    const myStrat = STRAT_W[me.strategy];
+    const myAssetScore = a => a.future * (1 + 0.35 * a.breakout);
+    const results = [];
+
+    for (const t of model.teams) {
+      if (t === me) continue;
+      const w = STRAT_W[t.strategy];
+      const theirBefore = lineupValue(t.players, model.slots).total;
+      // What I'd want from them: young / breakout / picks
+      const want = t.assets.filter(a => a.value >= 400 && (a.kind === 'pick' || a.ageMult >= 1 || a.breakout >= 0.45))
+        .sort((a, b) => myAssetScore(b) - myAssetScore(a)).slice(0, 14);
+      const cap = maxPer >= 3 ? 8 : 99;
+      const giveSets = combos(give.slice(0, cap), maxPer), getSets = combos(want.slice(0, cap + 2), maxPer);
+      for (const G of giveSets) {
+        const gv = packageValue(G); if (gv < 800) continue;
+        for (const R of getSets) {
+          const rv = packageValue(R); if (rv < 600) continue;
+          const diff = (rv - gv) / Math.max(rv, gv); // + means I receive more market value
+          if (Math.abs(diff) > tol) continue;
+          // Partner's view
+          const gIds = new Set(G.map(a => a.id)), rIds = new Set(R.map(a => a.id));
+          const theirAfterPlayers = t.players.filter(p => !rIds.has(p.id)).concat(G.filter(a => a.kind === 'player'));
+          const theirAfter = lineupValue(theirAfterPlayers, model.slots).total;
+          const theirNow = theirAfter - theirBefore;
+          const theirFut = G.reduce((s, a) => s + a.future, 0) - R.reduce((s, a) => s + a.future, 0);
+          const partnerU = (w.now * theirNow + w.fut * theirFut) / 1000 - Math.max(0, diff) * 2.5;
+          if (partnerU <= 0.15) continue;
+          // My view
+          const myAfterPlayers = myPlayersBefore.filter(p => !gIds.has(p.id)).concat(R.filter(a => a.kind === 'player'));
+          const myNow = lineupValue(myAfterPlayers, model.slots).total - myLineupBefore;
+          const myFut = R.reduce((s, a) => s + myAssetScore(a), 0) - G.reduce((s, a) => s + a.future, 0);
+          const myU = (myStrat.now * myNow + myStrat.fut * myFut) / 1000;
+          if (myU <= 0.2) continue;
+          const score = myU + 0.6 * Math.min(partnerU, 3) - 4 * Math.max(0, Math.abs(diff) - 0.04);
+          results.push({ partner: t, give: G, get: R, gv, rv, diff, myU, partnerU, theirNow, theirFut, myNow, myFut, score });
+        }
+      }
+    }
+    results.sort((a, b) => b.score - a.score);
+    // Diversity: max 3 per partner, each of my assets at most twice, each of theirs once
+    const out = [], perPartner = {}, myUse = {}, theirUse = {};
+    for (const r of results) {
+      const pid = r.partner.rosterId;
+      if ((perPartner[pid] || 0) >= 3) continue;
+      if (r.give.some(a => (myUse[a.id] || 0) >= 2)) continue;
+      if (r.get.some(a => theirUse[a.id])) continue;
+      out.push(r); perPartner[pid] = (perPartner[pid] || 0) + 1;
+      r.give.forEach(a => myUse[a.id] = (myUse[a.id] || 0) + 1);
+      r.get.forEach(a => theirUse[a.id] = 1);
+      if (out.length >= (prefs.maxResults ?? 20)) break;
+    }
+    return out;
+  }
+
+  function combos(arr, k) {
+    const out = arr.map(a => [a]);
+    if (k >= 2) for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) out.push([arr[i], arr[j]]);
+    if (k >= 3) for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) for (let l = j + 1; l < arr.length; l++) out.push([arr[i], arr[j], arr[l]]);
+    return out;
+  }
+
+  // Plain-English reasons for a trade
+  function explain(tr, model) {
+    const why = [];
+    const stratName = { winnow: 'win-now', middle: 'in the middle', rebuild: 'rebuilding' };
+    const t = tr.partner;
+    if (tr.theirNow > 150) why.push(`${t.name} are ${stratName[t.strategy]} (${t.wins}–${t.losses}) and their best starting lineup gets stronger by about ${fmt(tr.theirNow)} points of value.`);
+    else if (tr.theirFut > 0) why.push(`${t.name} are ${stratName[t.strategy]} (${t.wins}–${t.losses}) and gain long-term value.`);
+    for (const a of tr.get) why.push(`You get ${a.name}: ${assetReason(a)}`);
+    for (const a of tr.give) if (a.kind === 'player') why.push(`You give ${a.name}: ${sellReason(a)}`);
+    const pct = Math.round(tr.diff * 100);
+    why.push(`Market check: you give ${fmt(tr.gv)}, you get ${fmt(tr.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${pct}% their way`}).`);
+    return why;
+  }
+  function assetReason(a) {
+    if (a.kind === 'pick') return `a ${a.season} ${['', '1st', '2nd', '3rd', '4th'][a.round] || 'round ' + a.round}-round pick, the kind of asset rebuilders want.`;
+    const bits = [];
+    if (a.age) bits.push(`age ${Math.floor(a.age)}`);
+    const s = a.signals || {};
+    if (a.ppgRank && a.valRank && a.valRank - a.ppgRank >= 5) bits.push(`scoring like ${a.pos}${a.ppgRank} but valued as ${a.pos}${a.valRank}`);
+    if (s.usage >= 0.75) bits.push(`top-tier usage among ${a.pos}s${a.snapShare ? ` (${Math.round(a.snapShare * 100)}% snaps)` : ''}`);
+    if (a.adds >= 1000) bits.push(`trending on Sleeper (${fmt(a.adds)} adds in 72h)`);
+    if (a.trend > 0 && a.trend / Math.max(1, a.value) > 0.05) bits.push(`value up ${fmt(a.trend)} in 30 days`);
+    if ((a.yoe ?? 9) <= 1) bits.push(a.yoe === 0 ? 'rookie' : '2nd-year player');
+    if (bits.length <= 1) bits.push('young enough to hold or grow his value');
+    return bits.join(', ') + '.';
+  }
+  function sellReason(a) {
+    const bits = [];
+    if (a.age) bits.push(`age ${Math.floor(a.age)}`);
+    if (a.ageMult < 0.9) bits.push(`${a.pos}s usually lose value from here (we expect him to keep about ${Math.round(a.ageMult * 100)}% over 2 years)`);
+    if (a.now / Math.max(1, a.value) > 0.7) bits.push('worth more to a contender this season than to your rebuild');
+    if (a.trend < 0) bits.push(`value already down ${fmt(-a.trend)} in 30 days`);
+    if (!bits.length) bits.push('selling now gets more back than he is likely to be worth later');
+    return bits.join(', ') + '.';
+  }
+  const fmt = x => Math.round(x).toLocaleString('en-GB');
+
+  return { buildModel, generateTrades, explain, lineupValue, ageMult, parsePick, packageValue, fmt };
+})();
+if (typeof module !== 'undefined') module.exports = ENGINE;
+/*ENGINE-END*/
+</script>
+
+<script>
+// ---------- App (data loading + UI) ----------
+const LEAGUE_ID = '1312072052827521024';
+const MY_USERNAME = 'childsy14';
+const SLEEPER = 'https://api.sleeper.app/v1';
+const fmt = ENGINE.fmt;
+
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('tf:' + k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('tf:' + k, JSON.stringify(v)); } catch {} },
+};
+let prefs = Object.assign({ fairness: 0.12, maxAssets: 2, protectPicks: true, maxResults: 20, strategy: {}, marks: {} }, store.get('prefs', {}));
+const savePrefs = () => store.set('prefs', prefs);
+let RAW = null, MODEL = null;
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const status = (msg, err) => { const el = $('#status'); el.textContent = msg; el.className = 'status' + (err ? ' err' : ''); };
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${r.status} from ${new URL(url).host}`);
+  return r.json();
+}
+// Sleeper's full player list is ~5 MB: cache it in IndexedDB for a day.
+function idb() {
+  return new Promise((res, rej) => {
+    try { const q = indexedDB.open('tradefinder', 1); q.onupgradeneeded = () => q.result.createObjectStore('kv'); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }
+    catch (e) { rej(e); }
+  });
+}
+async function cached(key, maxAgeMs, loader) {
+  try {
+    const db = await idb();
+    const hit = await new Promise(r => { const q = db.transaction('kv').objectStore('kv').get(key); q.onsuccess = () => r(q.result); q.onerror = () => r(null); });
+    if (hit && Date.now() - hit.t < maxAgeMs) return hit.v;
+    const v = await loader();
+    db.transaction('kv', 'readwrite').objectStore('kv').put({ t: Date.now(), v }, key);
+    return v;
+  } catch { return loader(); }
+}
+const soft = p => p.catch(e => { console.warn(e); return null; });
+
+async function load(force) {
+  status('Fetching Sleeper and FantasyCalc…');
+  try {
+    const league = await getJSON(`${SLEEPER}/league/${LEAGUE_ID}`);
+    const numTeams = league.total_rosters || 10;
+    const qbSlots = (league.roster_positions || []).filter(s => s === 'QB' || s === 'SUPER_FLEX').length;
+    const ppr = league.scoring_settings?.rec ?? 0.5;
+    const fcUrl = `https://api.fantasycalc.com/values/current?isDynasty=true&numQbs=${qbSlots >= 2 ? 2 : 1}&numTeams=${numTeams}&ppr=${ppr}&includeAdjacent=true`;
+    const [users, rosters, tradedPicks, nfl, fc, trending] = await Promise.all([
+      getJSON(`${SLEEPER}/league/${LEAGUE_ID}/users`),
+      getJSON(`${SLEEPER}/league/${LEAGUE_ID}/rosters`),
+      soft(getJSON(`${SLEEPER}/league/${LEAGUE_ID}/traded_picks`)),
+      soft(getJSON(`${SLEEPER}/state/nfl`)),
+      getJSON(fcUrl).catch(e => { throw new Error('FantasyCalc values failed to load (' + e.message + ')'); }),
+      soft(getJSON(`${SLEEPER}/players/nfl/trending/add?lookback_hours=72&limit=200`)),
+    ]);
+    status('Loading player details and season stats…');
+    const season = nfl?.season || league.season;
+    const [sleeperPlayers, stats] = await Promise.all([
+      soft(force ? getJSON(`${SLEEPER}/players/nfl`) : cached('players', 86400000, () => getJSON(`${SLEEPER}/players/nfl`))),
+      soft(getJSON(`${SLEEPER}/stats/nfl/regular/${season}`).catch(() => getJSON(`https://api.sleeper.com/stats/nfl/${season}?season_type=regular`))),
+    ]);
+    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week };
+    rebuild();
+    const missing = [!stats && 'season stats', !trending && 'trending adds', !sleeperPlayers && 'player details'].filter(Boolean);
+    status(`Updated ${new Date().toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` + (missing.length ? ` · couldn't load ${missing.join(', ')}, so those signals are skipped` : ''));
+  } catch (e) {
+    console.error(e);
+    status('Could not load data: ' + e.message, true);
+  }
+}
+
+function rebuild() {
+  MODEL = ENGINE.buildModel(RAW, prefs);
+  $('#title').textContent = RAW.league.name;
+  $('#subtitle').textContent = `${MODEL.me.name} · ${MODEL.me.wins}–${MODEL.me.losses} · strategy: ${label(MODEL.me.strategy)}${RAW.week ? ` · week ${RAW.week}` : ''}`;
+  renderTrades(); renderTargets(); renderMyTeam(); renderLeague(); renderSettings();
+}
+const label = s => ({ winnow: 'Win now', middle: 'Middle', rebuild: 'Rebuild' }[s]);
+const stratPill = t => `<span class="pill ${t.strategy}">${label(t.strategy)}</span>`;
+const assetMeta = a => a.kind === 'pick' ? 'Draft pick' : `${a.pos} · ${a.team}${a.age ? ' · ' + Math.floor(a.age) : ''}`;
+
+function renderTrades() {
+  const trades = ENGINE.generateTrades(MODEL, prefs);
+  const el = $('#tab-trades');
+  if (!trades.length) { el.innerHTML = `<div class="card">No trades pass the filters right now. Try widening the fairness range or marking more players as "Shop" in My team.</div>`; return; }
+  el.innerHTML = `<p class="small">Ranked by how much each deal helps your rebuild, with a check that the other side would want it too. Values are FantasyCalc dynasty values for your format.</p>` +
+    trades.map((tr, i) => {
+      const side = (title, list) => `<div class="side"><h4>${title}</h4>${list.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}${a.breakout >= 0.55 && a.kind === 'player' ? '<span class="tag hot">breakout</span>' : ''}</div><div class="meta">${esc(assetMeta(a))}</div></div><div class="val">${fmt(a.value)}</div></div>`).join('')}</div>`;
+      const d = Math.max(-0.3, Math.min(0.3, tr.diff));
+      const left = 50 + (d / 0.3) * 50;
+      const color = Math.abs(tr.diff) <= 0.06 ? 'var(--good)' : 'var(--warn)';
+      return `<div class="card">
+        <div class="trade-top"><div><span class="small">#${i + 1}</span> <span class="partner">${esc(tr.partner.name)}</span> ${stratPill(tr.partner)}</div><span class="pill">${tr.partner.wins}–${tr.partner.losses}</span></div>
+        <div class="sides">${side('You give', tr.give)}${side('You get', tr.get)}</div>
+        <div class="meter"><b style="left:${Math.min(50, left)}%;width:${Math.abs(left - 50)}%;background:${color}"></b><i style="left:50%"></i></div>
+        <div class="small" style="display:flex;justify-content:space-between"><span>favours them</span><span>even</span><span>favours you</span></div>
+        <ul class="why">${ENGINE.explain(tr, MODEL).map(w => `<li>${esc(w)}</li>`).join('')}</ul>
+      </div>`;
+    }).join('');
+}
+
+function renderTargets() {
+  const list = [...MODEL.players.values()].filter(p => p.owner !== MODEL.me.rosterId && p.value >= 300 && p.breakout > 0)
+    .sort((a, b) => b.breakout - a.breakout).slice(0, 40);
+  const ownerName = id => MODEL.teamById.get(id)?.name || '';
+  const s = MODEL.haveStats;
+  $('#tab-targets').innerHTML = `<p class="small">Players on other rosters with the strongest breakout signals: youth, ${s ? 'usage, production ahead of value, ' : ''}Sleeper trending adds and 30-day value momentum.</p>
+  <div class="card scroll"><table><thead><tr><th>Player</th><th>Owner</th><th class="n">Value</th>${s ? '<th class="n">PPG</th>' : ''}<th class="n">Adds</th><th>Score</th></tr></thead><tbody>
+  ${list.map(p => `<tr><td><b>${esc(p.name)}</b><div class="small">${esc(assetMeta(p))}${p.ppgRank && p.valRank ? ` · scoring ${p.pos}${p.ppgRank}, valued ${p.pos}${p.valRank}` : ''}</div></td>
+    <td class="small">${esc(ownerName(p.owner))}<br>${stratPill(MODEL.teamById.get(p.owner))}</td><td class="n">${fmt(p.value)}${p.trend ? `<div class="small" style="color:${p.trend > 0 ? 'var(--good)' : 'var(--bad)'}">${p.trend > 0 ? '+' : ''}${fmt(p.trend)}</div>` : ''}</td>
+    ${s ? `<td class="n">${p.ppg != null ? p.ppg.toFixed(1) : '–'}</td>` : ''}<td class="n">${p.adds ? fmt(p.adds) : '–'}</td>
+    <td><div class="bar"><span style="width:${Math.round(p.breakout * 100)}%"></span></div><div class="small">${Math.round(p.breakout * 100)}</div></td></tr>`).join('')}
+  </tbody></table></div>`;
+}
+
+function renderMyTeam() {
+  const me = MODEL.me;
+  const starters = ENGINE.lineupValue(me.players, MODEL.slots).starters;
+  const rows = me.assets.slice().sort((a, b) => b.value - a.value);
+  const markBtns = a => {
+    const m = prefs.marks[a.id] || 'auto';
+    return `<span class="seg" data-id="${esc(a.id)}">${['protect', 'auto', 'shop'].map(k => `<button data-m="${k}" class="${m === k ? 'on' : ''}">${k[0].toUpperCase() + k.slice(1)}</button>`).join('')}</span>`;
+  };
+  const tags = a => {
+    if (a.kind === 'pick') return '';
+    let t = '';
+    if (a.sell >= 0.45) t += '<span class="tag sell">sell</span>';
+    if (a.breakout >= 0.55) t += '<span class="tag buy">core</span>';
+    if (starters.has(a.id)) t += '<span class="tag">starter</span>';
+    return t;
+  };
+  $('#tab-myteam').innerHTML = `<p class="small"><b>Protect</b> keeps a player out of every trade, and <b>Shop</b> forces him into the trade search. <b>Auto</b> lets the site decide: it shops players who are past their age peak or whose value is mostly about this season.</p>
+  <div class="card scroll"><table><thead><tr><th>Asset</th><th class="n">Value</th><th class="n">2-yr</th><th>Trade?</th></tr></thead><tbody>
+  ${rows.map(a => `<tr><td><b>${esc(a.name)}</b>${tags(a)}<div class="small">${esc(assetMeta(a))}${a.injury ? ' · ' + esc(a.injury) : ''}</div></td>
+  <td class="n">${fmt(a.value)}</td><td class="n" style="color:${a.ageMult >= 1 ? 'var(--good)' : a.ageMult < 0.8 ? 'var(--bad)' : 'var(--muted)'}">${fmt(a.future)}</td><td>${markBtns(a)}</td></tr>`).join('')}
+  </tbody></table><p class="small">"2-yr" is the value we expect him to have in about two years, based on his age and position.</p></div>`;
+  $('#tab-myteam').querySelectorAll('.seg button').forEach(b => b.onclick = () => {
+    const id = b.parentElement.dataset.id; const m = b.dataset.m;
+    if (m === 'auto') delete prefs.marks[id]; else prefs.marks[id] = m;
+    savePrefs(); rebuild();
+  });
+}
+
+function renderLeague() {
+  const teams = MODEL.teams.slice().sort((a, b) => a.contendRank - b.contendRank);
+  $('#tab-league').innerHTML = `<p class="small">Strategies are guessed from lineup strength, record and points scored. Change any team's strategy and the trade search will treat them that way.</p>
+  <div class="card scroll"><table><thead><tr><th>Team</th><th class="n">Rec</th><th class="n">Lineup</th><th class="n">Roster age</th><th>Strategy</th></tr></thead><tbody>
+  ${teams.map(t => `<tr><td><b>${esc(t.name)}</b>${t === MODEL.me ? ' <span class="tag buy">you</span>' : ''}<div class="small">${esc(t.username)} · ${fmt(t.pf)} PF</div></td>
+    <td class="n">${t.wins}–${t.losses}</td><td class="n">${fmt(t.lineupNow)}</td><td class="n">${t.avgAge ? t.avgAge.toFixed(1) : '–'}</td>
+    <td><select data-r="${t.rosterId}">${['winnow', 'middle', 'rebuild'].map(s => `<option value="${s}" ${t.strategy === s ? 'selected' : ''}>${label(s)}${s === t.autoStrategy && t !== MODEL.me ? ' (auto)' : ''}</option>`).join('')}</select></td></tr>`).join('')}
+  </tbody></table><p class="small">"Lineup" is this season's value of each team's best possible starting lineup. "Roster age" is weighted by value.</p></div>`;
+  $('#tab-league').querySelectorAll('select').forEach(s => s.onchange = () => { prefs.strategy[s.dataset.r] = s.value; savePrefs(); rebuild(); });
+}
+
+function renderSettings() {
+  $('#tab-settings').innerHTML = `<div class="card">
+    <label class="set"><span>Fairness range<div class="small">How far apart the two sides' market values can be</div></span>
+      <select id="s-fair">${[0.06, 0.1, 0.12, 0.15, 0.2].map(v => `<option value="${v}" ${prefs.fairness == v ? 'selected' : ''}>±${Math.round(v * 100)}%</option>`).join('')}</select></label>
+    <label class="set"><span>Max assets per side</span>
+      <select id="s-max">${[1, 2, 3].map(v => `<option ${prefs.maxAssets == v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+    <label class="set"><span>Never trade away my picks</span><input type="checkbox" id="s-picks" ${prefs.protectPicks ? 'checked' : ''}></label>
+    <label class="set"><span>Number of trades to show</span>
+      <select id="s-n">${[10, 20, 30].map(v => `<option ${prefs.maxResults == v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+    <div class="row" style="margin-top:10px"><button class="btn ghost" id="s-reset">Reset strategies and marks</button></div>
+    <p class="small">Data: Sleeper (rosters, picks, stats, trending adds) and <a href="https://fantasycalc.com" target="_blank" rel="noopener">FantasyCalc</a> (trade values). Settings are saved in this browser only.</p>
+  </div>`;
+  $('#s-fair').onchange = e => { prefs.fairness = +e.target.value; savePrefs(); rebuild(); };
+  $('#s-max').onchange = e => { prefs.maxAssets = +e.target.value; savePrefs(); rebuild(); };
+  $('#s-picks').onchange = e => { prefs.protectPicks = e.target.checked; savePrefs(); rebuild(); };
+  $('#s-n').onchange = e => { prefs.maxResults = +e.target.value; savePrefs(); rebuild(); };
+  $('#s-reset').onclick = () => { prefs.strategy = {}; prefs.marks = {}; savePrefs(); rebuild(); };
+}
+
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#tabs button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('main section').forEach(s => s.classList.toggle('hidden', s.id !== 'tab-' + b.dataset.tab));
+});
+$('#refresh').onclick = () => load(true);
+load(false);
+</script>
+</body>
+</html>
