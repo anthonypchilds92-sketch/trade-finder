@@ -82,6 +82,7 @@
       <button data-tab="targets">Targets</button>
       <button data-tab="myteam">My team</button>
       <button data-tab="league">League</button>
+      <button data-tab="offers">Offers</button>
       <button data-tab="settings">Settings</button>
     </nav>
   </div>
@@ -94,6 +95,7 @@
   <section id="tab-targets" class="hidden"></section>
   <section id="tab-myteam" class="hidden"></section>
   <section id="tab-league" class="hidden"></section>
+  <section id="tab-offers" class="hidden"></section>
   <section id="tab-settings" class="hidden"></section>
 </main>
 
@@ -544,6 +546,36 @@ const ENGINE = (() => {
   }
   const rawValue = assets => assets.reduce((s, a) => s + a.value, 0);
 
+  // ---- Learning from offers you've sent ----
+  // offers: [{ownerId, partnerName, give:[{id,name,value}], get:[...], status:'open'|'accepted'|'rejected'|'withdrawn', reason}]
+  const offerKey = (give, get) => give.map(a => a.id).sort().join(',') + '|' + get.map(a => a.id).sort().join(',');
+  function learnFromOffers(offers) {
+    const L = { mgrBias: {}, premium: {}, dislike: {}, rejectedKeys: new Set(), offeredKeys: new Set(), notes: {} };
+    const add = (o, k, v, lo, hi) => { o[k] = clamp((o[k] || 0) + v, lo, hi); };
+    const note = (owner, txt) => (L.notes[owner] ??= []).push(txt);
+    for (const o of offers || []) {
+      const key = offerKey(o.give, o.get);
+      L.offeredKeys.add(key);
+      if (o.status === 'accepted') {
+        add(L.mgrBias, o.ownerId, -0.15, -0.5, 1.5);
+        note(o.ownerId, 'accepted');
+      } else if (o.status === 'rejected') {
+        L.rejectedKeys.add(key);
+        if (o.reason === 'more') { add(L.mgrBias, o.ownerId, 0.35, -0.5, 1.5); note(o.ownerId, 'wanted more'); }
+        else if (o.reason === 'keep') {
+          add(L.mgrBias, o.ownerId, 0.1, -0.5, 1.5);
+          for (const a of o.get) add(L.premium, a.id, 0.15, 0, 0.6);
+          note(o.ownerId, `wouldn't sell ${o.get.map(a => a.name).join(', ')}`);
+        } else if (o.reason === 'dislike') {
+          L.dislike[o.ownerId] ??= {};
+          for (const a of o.give) add(L.dislike[o.ownerId], a.id, 0.3, 0, 1);
+          note(o.ownerId, `didn't want ${o.give.map(a => a.name).join(', ')}`);
+        } else { add(L.mgrBias, o.ownerId, 0.2, -0.5, 1.5); note(o.ownerId, 'said no'); }
+      }
+    }
+    return L;
+  }
+
   // ---- Shared trade evaluator ----
   function makeCtx(model, prefs) {
     const me = model.me;
@@ -555,7 +587,7 @@ const ENGINE = (() => {
     // A manager whose player dipped recently still anchors to the old price; after a long dip they let go.
     const anchored = a => a.buyLow ? 1 + a.dropPct * (1 - a.dipFatigue) : 1;
     return {
-      me, tol: prefs.fairness ?? 0.12, myAssetScore, anchored, even: prefs.evenDeals ?? 'prefer',
+      me, tol: prefs.fairness ?? 0.12, myAssetScore, anchored, even: prefs.evenDeals ?? 'prefer', learn: prefs.learn || null,
       myStrat: STRAT_W[me.strategy],
       myLineupBefore: lineupValue(me.players, model.slots).total,
       theirBefore: new Map(model.teams.map(t => [t.rosterId, lineupValue(t.players, model.slots)])),
@@ -609,6 +641,18 @@ const ENGINE = (() => {
     res.myNow = lineupValue(myAfter, model.slots).total - ctx.myLineupBefore;
     res.myFut = pm(R.map(ctx.myAssetScore)) - pm(G.map(a => stratFuture(a, me.strategy)));
     res.myU = (ctx.myStrat.now * res.myNow + ctx.myStrat.fut * res.myFut) / 1000;
+    // What we've learned from offers you've sent
+    const L = ctx.learn;
+    if (L) {
+      if (L.rejectedKeys.has(offerKey(G, R))) return fail('they already turned this exact offer down');
+      res.learned = [];
+      const bias = L.mgrBias[t.ownerId] || 0;
+      if (bias) { res.partnerU -= bias; res.learned.push(bias > 0 ? 'they have turned down offers, so they likely need a bit more' : 'they have accepted offers from you before'); }
+      const prem = R.reduce((s, a) => s + (L.premium[a.id] || 0) * a.value, 0) / 1000;
+      if (prem) { res.partnerU -= prem; res.learned.push(`${R.filter(a => L.premium[a.id]).map(a => a.name).join(', ')} is valued above market by managers`); }
+      const dis = G.reduce((s, a) => s + (L.dislike[t.ownerId]?.[a.id] || 0) * a.value, 0) / 1000;
+      if (dis) { res.partnerU -= dis; res.learned.push(`they didn't want ${G.filter(a => L.dislike[t.ownerId]?.[a.id]).map(a => a.name).join(', ')} last time`); }
+    }
     if (res.partnerU <= (opts.minPartner ?? 0.15)) return fail('not enough in it for them');
     if (res.myU <= (opts.minMine ?? 0.2)) return fail('not enough in it for you');
     // Managers who actually trade are worth more of your time
@@ -728,6 +772,7 @@ const ENGINE = (() => {
     for (const a of tr.get) why.push(`You get ${a.name}: ${assetReason(a)}`);
     for (const a of tr.give) if (a.kind === 'player') why.push(`You give ${a.name}: ${sellReason(a)}`);
     if (tr.tendency?.length) why.push(`Their trade history: ${tr.tendency.join('; ')}.`);
+    if (tr.learned?.length) why.push(`From your past offers: ${tr.learned.join('; ')}.`);
     const pct = Math.round(tr.diff * 100);
     const side = (list, eff) => list.length > 1 ? `${fmt(rawValue(list))} (worth ${fmt(eff)} as a package)` : fmt(eff);
     why.push(`Market check: you give ${side(tr.give, tr.gv)}, you get ${side(tr.get, tr.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${pct}% their way`}).`);
@@ -748,6 +793,7 @@ const ENGINE = (() => {
     }
     if (t.strategy !== 'rebuild') for (const a of r.get) if (a.injStash) out.push(`${a.name} is ${a.injury} and won't help them this season, so they may happily swap him for players who score now.`);
     if (r.tendency?.length) out.push(`Their trade history: ${r.tendency.join('; ')}.`);
+    if (r.learned?.length) out.push(`From your past offers: ${r.learned.join('; ')}.`);
     const pct = Math.round(r.diff * 100);
     out.push(`Market: you give ${r.give.length > 1 ? fmt(rawValue(r.give)) + ' (worth ' + fmt(r.gv) + ' as a package)' : fmt(r.gv)} for ${fmt(r.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${-pct}% over market, paid by you`}).`);
     return out;
@@ -791,7 +837,7 @@ const ENGINE = (() => {
   }
   const fmt = x => Math.round(x).toLocaleString('en-GB');
 
-  return { buildModel, generateTrades, offersFor, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
+  return { buildModel, generateTrades, offersFor, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
 })();
 if (typeof module !== 'undefined') module.exports = ENGINE;
 /*ENGINE-END*/
@@ -811,6 +857,11 @@ const store = {
 let prefs = Object.assign({ fairness: 0.12, maxAssets: 2, protectPicks: true, maxResults: 20, strategy: {}, marks: {} }, store.get('prefs', {}));
 const savePrefs = () => store.set('prefs', prefs);
 let RAW = null, MODEL = null;
+let OFFERS = store.get('offers', []);
+const saveOffers = () => store.set('offers', OFFERS);
+let LEARN = null;
+const P = () => Object.assign({}, prefs, { learn: LEARN });
+const CARDS = []; // trades currently on screen, for the "I've sent this offer" buttons
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -906,16 +957,19 @@ async function load(force) {
 
 function rebuild() {
   MODEL = ENGINE.buildModel(RAW, prefs);
+  autoDetectAccepted();
+  LEARN = ENGINE.learnFromOffers(OFFERS);
+  CARDS.length = 0;
   $('#title').textContent = RAW.league.name;
   $('#subtitle').textContent = `${MODEL.me.name} · ${MODEL.me.wins}–${MODEL.me.losses} · strategy: ${label(MODEL.me.strategy)}${RAW.week ? ` · week ${RAW.week}` : ''}`;
-  renderTrades(); renderTargets(); renderMyTeam(); renderLeague(); renderSettings();
+  renderTrades(); renderTargets(); renderMyTeam(); renderLeague(); renderOffers(); renderSettings();
 }
 const label = s => ({ winnow: 'Win now', middle: 'Middle', rebuild: 'Rebuild' }[s]);
 const stratPill = t => `<span class="pill ${t.strategy}">${label(t.strategy)}</span>`;
 const assetMeta = a => a.kind === 'pick' ? 'Draft pick' : `${a.pos} · ${a.team}${a.age ? ' · ' + Math.floor(a.age) : ''}`;
 
 function renderTrades() {
-  const trades = ENGINE.generateTrades(MODEL, prefs);
+  const trades = ENGINE.generateTrades(MODEL, P());
   const el = $('#tab-trades');
   if (!trades.length) { el.innerHTML = `<div class="card">No trades pass the filters right now. Try widening the fairness range or marking more players as "Shop" in My team.</div>`; return; }
   el.innerHTML = `<p class="small">Ranked by how much each deal helps your rebuild, with a check that the other side would want it too. Values are FantasyCalc dynasty values for your format.</p>` +
@@ -930,8 +984,10 @@ function renderTrades() {
         <div class="meter"><b style="left:${Math.min(50, left)}%;width:${Math.abs(left - 50)}%;background:${color}"></b><i style="left:50%"></i></div>
         <div class="small" style="display:flex;justify-content:space-between"><span>favours them</span><span>even</span><span>favours you</span></div>
         <ul class="why">${ENGINE.explain(tr, MODEL).map(w => `<li>${esc(w)}</li>`).join('')}</ul>
+        ${offerButton(tr)}
       </div>`;
     }).join('');
+  bindOfferButtons(el);
 }
 
 function renderTargets() {
@@ -983,7 +1039,7 @@ function toggleOffers(tr) {
   const next = tr.nextElementSibling;
   if (next && next.classList.contains('offer-row')) { next.remove(); tr.classList.remove('open'); return; }
   document.querySelectorAll('#tab-targets .offer-row').forEach(r => { r.previousElementSibling?.classList.remove('open'); r.remove(); });
-  const { target, team, offers, nearest } = ENGINE.offersFor(MODEL, prefs, tr.dataset.id, 3);
+  const { target, team, offers, nearest } = ENGINE.offersFor(MODEL, P(), tr.dataset.id, 3);
   const cols = tr.children.length;
   let html;
   if (offers.length) {
@@ -991,7 +1047,7 @@ function toggleOffers(tr) {
       offers.map((r, i) => `<div class="card" style="margin:8px 0">
         <div class="small" style="margin-bottom:6px"><b>Offer ${i + 1}</b></div>
         <div class="sides"><div class="side"><h4>You send</h4>${assetRows(r.give)}</div><div class="side"><h4>You get</h4>${assetRows(r.get)}</div></div>
-        <ul class="why">${ENGINE.theirSideReasons(r).map(w => `<li>${esc(w)}</li>`).join('')}</ul></div>`).join('');
+        <ul class="why">${ENGINE.theirSideReasons(r).map(w => `<li>${esc(w)}</li>`).join('')}</ul>${offerButton(r)}</div>`).join('');
   } else if (nearest) {
     html = `<div class="card" style="margin:8px 0"><div class="small" style="margin-bottom:6px">No offer from your tradeable players gets a fair deal they'd want. The closest:</div>
       <div class="sides"><div class="side"><h4>You send</h4>${assetRows(nearest.give)}</div><div class="side"><h4>You get</h4>${assetRows(nearest.get)}</div></div>
@@ -1002,6 +1058,100 @@ function toggleOffers(tr) {
   const row = document.createElement('tr'); row.className = 'offer-row';
   row.innerHTML = `<td colspan="${cols}" style="background:var(--bg)">${html}</td>`;
   tr.after(row); tr.classList.add('open');
+  bindOfferButtons(row);
+}
+
+// ---------- Offer tracking ----------
+function offerButton(tr) {
+  const key = ENGINE.offerKey(tr.give, tr.get);
+  const existing = OFFERS.find(o => o.key === key && o.status === 'open');
+  if (existing) return `<div class="row" style="margin-top:10px"><span class="pill" style="color:var(--good)">Offer sent ${new Date(existing.ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} · open</span></div>`;
+  CARDS.push(tr);
+  return `<div class="row" style="margin-top:10px"><button class="btn ghost" data-card="${CARDS.length - 1}">I've sent this offer</button></div>`;
+}
+function bindOfferButtons(root) {
+  root.querySelectorAll('button[data-card]').forEach(b => b.onclick = e => {
+    e.stopPropagation();
+    const tr = CARDS[+b.dataset.card]; if (!tr) return;
+    const slim = a => ({ id: a.id, name: a.name, value: Math.round(a.value), pos: a.pos, kind: a.kind });
+    OFFERS.unshift({
+      key: ENGINE.offerKey(tr.give, tr.get), ts: Date.now(), ownerId: tr.partner.ownerId, partnerName: tr.partner.name,
+      give: tr.give.map(slim), get: tr.get.map(slim), diff: tr.diff, status: 'open',
+    });
+    saveOffers();
+    b.outerHTML = `<span class="pill" style="color:var(--good)">Saved to Offers · open</span>`;
+    renderOffers();
+  });
+}
+// If a logged offer shows up as a completed Sleeper trade, mark it accepted automatically
+function autoDetectAccepted() {
+  const log = MODEL.tradeLog || [];
+  let changed = false;
+  for (const o of OFFERS) {
+    if (o.status !== 'open') continue;
+    const wantIds = o.get.filter(a => a.kind === 'player').map(a => a.id);
+    if (!wantIds.length) continue;
+    const hit = log.find(e => e.when >= o.ts - 86400000 && e.sides.some(sd => sd.team === MODEL.me && wantIds.every(id => sd.got.some(g => g.id === id))));
+    if (hit) { o.status = 'accepted'; o.closedTs = hit.when; o.auto = true; changed = true; }
+  }
+  if (changed) saveOffers();
+}
+function renderOffers() {
+  const el = $('#tab-offers'); if (!el) return;
+  const open = OFFERS.filter(o => o.status === 'open'), closed = OFFERS.filter(o => o.status !== 'open');
+  const assetList = l => l.map(a => `<div class="asset"><div class="nm">${esc(a.name)}</div><div class="val">${fmt(a.value)}</div></div>`).join('');
+  const card = (o, i) => `<div class="card">
+    <div class="trade-top"><span class="partner">${esc(o.partnerName)}</span><span class="small">${new Date(o.ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}</span></div>
+    <div class="sides"><div class="side"><h4>You offered</h4>${assetList(o.give)}</div><div class="side"><h4>For</h4>${assetList(o.get)}</div></div>
+    ${o.status === 'open' ? `<div class="row" style="margin-top:10px">
+        <button class="btn" data-act="accepted" data-i="${i}">Accepted</button>
+        <button class="btn ghost" data-act="reject" data-i="${i}">Rejected</button>
+        <button class="btn ghost" data-act="withdrawn" data-i="${i}">Withdrawn</button></div>
+      <div class="reasons hidden" data-for="${i}" style="margin-top:8px"><div class="small" style="margin-bottom:4px">Why did they say no?</div><div class="row">
+        <button class="btn ghost" data-act="rejected" data-reason="more" data-i="${i}">Wanted more</button>
+        <button class="btn ghost" data-act="rejected" data-reason="keep" data-i="${i}">Won't sell ${esc(o.get.length === 1 ? o.get[0].name : 'them')}</button>
+        <button class="btn ghost" data-act="rejected" data-reason="dislike" data-i="${i}">Didn't want my players</button>
+        <button class="btn ghost" data-act="rejected" data-reason="none" data-i="${i}">No reason given</button></div></div>`
+    : `<div class="row" style="margin-top:8px"><span class="pill" style="color:${o.status === 'accepted' ? 'var(--good)' : o.status === 'rejected' ? 'var(--bad)' : 'var(--muted)'}">${o.status[0].toUpperCase() + o.status.slice(1)}${o.auto ? ' (spotted on Sleeper)' : ''}${o.reason ? ' · ' + ({ more: 'wanted more', keep: "won't sell", dislike: "didn't want my players", none: 'no reason' }[o.reason]) : ''}</span>
+       <button class="btn ghost" data-act="undo" data-i="${i}" style="padding:3px 8px;font-size:12px">Undo</button></div>`}
+  </div>`;
+  // What the model has learned
+  const L = LEARN || { mgrBias: {}, premium: {}, notes: {} };
+  const teamByOwner = new Map((MODEL?.teams || []).map(t => [t.ownerId, t]));
+  const learnRows = Object.entries(L.notes).map(([owner, n]) => {
+    const b = L.mgrBias[owner] || 0;
+    return `<li><b>${esc(teamByOwner.get(owner)?.name || 'Manager')}</b>: ${esc(n.join(', '))}. ${b > 0.05 ? `Offers to them now need about ${Math.round(b * 1000)} more value to be suggested.` : b < -0.05 ? 'They now get slightly easier suggestions.' : ''}</li>`;
+  });
+  const premRows = Object.entries(L.premium).filter(([, v]) => v > 0).map(([id, v]) => {
+    const p = MODEL?.players.get(id);
+    return `<li>${esc(p?.name || id)}: managers value him about ${Math.round(v * 100)}% above market.</li>`;
+  });
+  el.innerHTML = `<p class="small">Tap "I've sent this offer" on any suggested trade or tapped-player offer to log it here. Mark the result when you hear back, and future suggestions adjust. If an offer goes through on Sleeper, it's marked accepted automatically.</p>
+    <h3 style="margin:14px 0 4px;font-size:16px">Open (${open.length})</h3>
+    ${open.length ? open.map(o => card(o, OFFERS.indexOf(o))).join('') : '<div class="card small">No open offers.</div>'}
+    <h3 style="margin:18px 0 4px;font-size:16px">What the model has learned</h3>
+    <div class="card">${learnRows.length || premRows.length ? `<ul class="why" style="margin:0">${learnRows.join('')}${premRows.join('')}</ul>` : '<div class="small">Nothing yet. Results from your offers will show here.</div>'}</div>
+    <h3 style="margin:18px 0 4px;font-size:16px">History (${closed.length})</h3>
+    ${closed.length ? closed.map(o => card(o, OFFERS.indexOf(o))).join('') : '<div class="card small">No closed offers yet.</div>'}
+    <div class="card"><b>Backup</b><p class="small">Your offers are saved in this browser only. Copy them now and then so you can restore them on another device, or if your browser data gets cleared.</p>
+      <div class="row"><button class="btn ghost" id="o-copy">Copy offer data</button></div>
+      <textarea id="o-import" placeholder="Paste offer data here to restore" style="margin-top:8px;min-height:70px"></textarea>
+      <div class="row" style="margin-top:6px"><button class="btn ghost" id="o-restore">Restore</button><span class="small" id="o-msg"></span></div></div>`;
+  el.querySelectorAll('button[data-act]').forEach(b => b.onclick = () => {
+    const o = OFFERS[+b.dataset.i]; const act = b.dataset.act;
+    if (act === 'reject') { el.querySelector(`.reasons[data-for="${b.dataset.i}"]`).classList.toggle('hidden'); return; }
+    if (act === 'undo') { o.status = 'open'; delete o.reason; delete o.closedTs; delete o.auto; }
+    else { o.status = act; o.closedTs = Date.now(); if (b.dataset.reason) o.reason = b.dataset.reason; }
+    saveOffers(); rebuild();
+  });
+  $('#o-copy').onclick = async () => {
+    try { await navigator.clipboard.writeText(JSON.stringify(OFFERS)); $('#o-msg').textContent = 'Copied.'; }
+    catch { $('#o-import').value = JSON.stringify(OFFERS); $('#o-msg').textContent = 'Couldn\'t copy automatically. The data is in the box, so select it and copy.'; }
+  };
+  $('#o-restore').onclick = () => {
+    try { const v = JSON.parse($('#o-import').value); if (!Array.isArray(v)) throw 0; OFFERS = v; saveOffers(); rebuild(); $('#o-msg').textContent = 'Restored.'; }
+    catch { $('#o-msg').textContent = "That doesn't look like offer data."; }
+  };
 }
 
 function renderMyTeam() {
