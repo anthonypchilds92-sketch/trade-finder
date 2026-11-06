@@ -32,7 +32,6 @@ for (const [id, p] of Object.entries(sleeper)) {
   if (byName.has(key)) byName.set(key, null); else byName.set(key, { id, name, pos: p.position, team: p.team });
 }
 
-console.log('names indexed:', byName.size, 'sample:', [...byName.keys()].slice(0, 5).join(' | '));
 const strip = h => h.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8217;|&rsquo;/g, "'").replace(/&#\d+;/g, ' ').replace(/\s+/g, ' ');
 const tag = (xml, t) => { const m = xml.match(new RegExp(`<${t}[^>]*>([\\s\\S]*?)<\\/${t}>`, 'i')); return m ? m[1].replace(/^<!\[CDATA\[|\]\]>$/g, '').trim() : ''; };
 const since = Date.now() - DAYS * 86400000;

@@ -369,6 +369,7 @@ const ENGINE = (() => {
     const pickValue = buildPickTable(fc);
     const statMap = normaliseStats(stats);
     const trendMap = new Map((trending || []).map(t => [String(t.player_id), t.count]));
+    const expertMap = new Map((input.experts?.players || []).map(e => [String(e.id), e]));
     const maxTrend = Math.max(1, ...trendMap.values());
 
     const userById = new Map(users.map(u => [u.user_id, u]));
@@ -463,9 +464,12 @@ const ENGINE = (() => {
           p.oppPerGame = opp(p); p.snapShare = snap(p);
         } else if (haveStats) { sig.usage = 0; sig.underval = 0; }
         sig.buzz = p.adds ? Math.log1p(p.adds) / Math.log1p(maxTrend) : 0;
+        const ex = expertMap.get(p.id);
+        if (expertMap.size) sig.expert = ex ? clamp(ex.score / 4, -1, 1) : 0;
+        p.expert = ex || null;
         const base = Math.max(1, p.value - p.trend);
         sig.momentum = clamp((p.trend / base) / 0.2);
-        const W = { youth: 0.25, usage: 0.25, underval: 0.25, buzz: 0.15, momentum: 0.10 };
+        const W = { youth: 0.25, usage: 0.25, underval: 0.25, buzz: 0.15, momentum: 0.10, expert: 0.10 };
         let tot = 0, w = 0;
         for (const k of Object.keys(W)) if (sig[k] != null) { tot += W[k] * sig[k]; w += W[k]; }
         p.signals = sig;
@@ -1232,6 +1236,7 @@ const ENGINE = (() => {
     if (a.ppgRank && a.valRank && a.valRank - a.ppgRank >= 5) bits.push(`scoring like ${a.pos}${a.ppgRank} but valued as ${a.pos}${a.valRank}`);
     if (s.usage >= 0.75) bits.push(`top-tier usage among ${a.pos}s${a.snapShare ? ` (${Math.round(a.snapShare * 100)}% snaps)` : ''}`);
     if (a.adds >= 1000) bits.push(`trending on Sleeper (${fmt(a.adds)} adds in 72h)`);
+    if (a.expert && a.expert.up > a.expert.down) bits.push(`tipped to rise in ${a.expert.sources.length} expert source${a.expert.sources.length === 1 ? '' : 's'}`);
     if (a.trend > 0 && a.trend / Math.max(1, a.value) > 0.05) bits.push(`value up ${fmt(a.trend)} in 30 days`);
     if ((a.yoe ?? 9) <= 1) bits.push(a.yoe === 0 ? 'rookie' : '2nd-year player');
     if (bits.length <= 1) bits.push('young enough to hold or grow his value');
@@ -1353,16 +1358,17 @@ async function load(force) {
     status('Loading player details, season stats and trade history…');
     RAW_ROSTERS = rosters.map(r => ({ roster_id: r.roster_id, owner_id: r.owner_id }));
     const season = nfl?.season || league.season;
-    const [sleeperPlayers, stats, history, weekInfo, ktc, historyKtc, tradeHistory] = await Promise.all([
+    const [sleeperPlayers, stats, history, weekInfo, ktc, experts, historyKtc, tradeHistory] = await Promise.all([
       soft(force ? getJSON(`${SLEEPER}/players/nfl`) : cached('players', 86400000, () => getJSON(`${SLEEPER}/players/nfl`))),
       soft(getJSON(`${SLEEPER}/stats/nfl/regular/${season}`).catch(() => getJSON(`https://api.sleeper.com/stats/nfl/${season}?season_type=regular`))),
       soft(fetch('data/history.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(fetch('data/week.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(fetch('data/ktc.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
+      soft(fetch('data/experts.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(fetch('data/history-ktc.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(loadTradeHistory(league, nfl?.week)),
     ]);
-    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc };
+    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc, experts };
     rebuild();
     const missing = [!tradeHistory && 'trade history', !stats && 'season stats', !trending && 'trending adds', !sleeperPlayers && 'player details'].filter(Boolean);
     status(`Updated ${new Date().toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` + (missing.length ? ` · couldn't load ${missing.join(', ')}, so those signals are skipped` : ''));
@@ -1409,6 +1415,28 @@ function renderTrades() {
   bindOfferButtons(el);
 }
 
+function expertSection() {
+  const X = RAW.experts;
+  if (!X?.players?.length) return `<h3 style="margin:18px 0 4px;font-size:16px">Expert tips</h3><div class="card small">Expert tips load from the daily GitHub job. Nothing yet.</div>`;
+  const sp = RAW.sleeperPlayers || {};
+  const ownerOf = id => { const p = MODEL.players.get(id); return p ? MODEL.teamById.get(p.owner) : null; };
+  const rows = X.players.filter(e => sp[e.id]?.team).map(e => ({ e, p: MODEL.players.get(e.id), t: ownerOf(e.id) }));
+  const risers = rows.filter(r => r.e.up > r.e.down).slice(0, 12);
+  const cooling = rows.filter(r => r.e.down > r.e.up && r.t === MODEL.me).slice(0, 5);
+  const ok = (X.sources || []).filter(s => s.ok).map(s => s.src);
+  const line = r => {
+    const p = r.p, e = r.e, own = r.t ? (r.t === MODEL.me ? '<span class="tag buy">yours</span>' : esc(r.t.name)) : '<span class="tag hot">free agent</span>';
+    const flat = p && Math.abs(p.trend / Math.max(1, p.value)) < 0.03;
+    return `<tr class="${r.t && r.t !== MODEL.me ? 'xtap' : ''}" data-id="${esc(e.id)}"><td><b>${esc(e.name)}</b>${flat && e.up > e.down ? '<span class="tag hot">value hasn\'t moved</span>' : ''}<div class="small">${esc(e.pos)} · ${esc(sp[e.id]?.team || '')} · ${e.up} positive / ${e.down} negative mention${e.up + e.down === 1 ? '' : 's'} · ${e.sources.length} site${e.sources.length === 1 ? '' : 's'}</div>
+      <div class="small">${e.articles.slice(0, 2).map(a => `<a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.title)}</a> <span style="opacity:.7">(${esc(a.src)})</span>`).join('<br>')}</div></td>
+      <td class="small">${own}</td><td class="n">${p ? fmt(p.value) : '–'}${p && p.trend ? `<div class="small" style="color:${p.trend > 0 ? 'var(--good)' : 'var(--bad)'}">${p.trend > 0 ? '+' : ''}${fmt(p.trend)}</div>` : ''}</td></tr>`;
+  };
+  return `<h3 style="margin:18px 0 4px;font-size:16px">Expert tips</h3>
+  <p class="small">Players that recent articles (last ${X.days} days) tip to rise: mentioned alongside words like buy, stash, breakout or sleeper, minus mentions alongside sell, fade or bust. Read from ${ok.length ? esc(ok.join(', ')) : 'fantasy sites'}, updated ${new Date(X.generatedAt).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' })}. "Value hasn't moved" means the market hasn't caught up yet. Tap a player on another team for offers.</p>
+  ${risers.length ? `<div class="card scroll"><table><tbody>${risers.map(line).join('')}</tbody></table></div>` : '<div class="card small">No clear risers in recent articles.</div>'}
+  ${cooling.length ? `<h3 style="margin:14px 0 4px;font-size:15px">Experts cooling on your players</h3><p class="small">More negative than positive mentions recently. Consider selling before the market follows.</p><div class="card scroll"><table><tbody>${cooling.map(line).join('')}</tbody></table></div>` : ''}`;
+}
+
 function renderWeek() {
   const el = $('#tab-week');
   const wi = RAW.weekInfo;
@@ -1432,11 +1460,13 @@ function renderWeek() {
       : n.cands.length ? `<div class="small" style="margin-top:6px">You have ${n.cands.map(c => esc(c.name)).join(', ')} at ${n.pos}, but no fair deal with them works for your rebuild right now.</div>`
       : `<div class="small" style="margin-top:6px">You don't have a tradeable ${n.pos} who would start for them.</div>`}</div>`;
   }).join('') : '<div class="card small">No contending team has a meaningful hole this week.</div>'}
+  ${expertSection()}
   <h3 style="margin:18px 0 4px;font-size:16px">New buy-low candidates</h3>
   ${!wi ? '<div class="card small">This fills in after the first weekly round-up runs.</div>' : newBL.length ? `<div class="card scroll"><table><tbody>${mini(newBL)}</tbody></table></div>` : '<div class="card small">No new buy-low candidates since the last round-up.</div>'}
   <h3 style="margin:18px 0 4px;font-size:16px">New injury stashes</h3>
   ${!wi ? '<div class="card small">This fills in after the first weekly round-up runs.</div>' : newST.length ? `<div class="card scroll"><table><tbody>${mini(newST)}</tbody></table></div>` : '<div class="card small">No new injury stashes since the last round-up.</div>'}`;
   bindOfferButtons(el);
+  el.querySelectorAll('tr.xtap').forEach(tr => tr.onclick = e => { if (e.target.closest('a')) return; toggleOffers(tr); });
   el.querySelectorAll('tr.tap').forEach(tr => tr.onclick = () => { document.querySelector('nav button[data-tab="targets"]').click(); const row = document.querySelector(`#tab-targets tr.tap[data-id="${tr.dataset.id}"]`); if (row) { row.scrollIntoView({ block: 'center' }); toggleOffers(row); } });
 }
 
