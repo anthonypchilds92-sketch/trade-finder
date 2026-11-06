@@ -6,7 +6,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 const UA = 'Mozilla/5.0 (personal dynasty trade-finder; one request per day)';
 const res = await fetch('https://keeptradecut.com/dynasty-rankings?page=0&filters=QB|WR|RB|TE|RDP&format=2', { headers: { 'User-Agent': UA, 'Accept': 'text/html' } });
 const html = await res.text();
-const m = html.match(/(?:var|let|const)\s+playersArray\s*=\s*(\[[\s\S]*?\]);\s*\n/) || html.match(/playersArray\s*=\s*(\[[\s\S]*?\]);/);
+const m = html.match(/<script[^>]*id=["']ktc-players["'][^>]*>([\s\S]*?)<\/script>/) || html.match(/(?:var|let|const)\s+playersArray\s*=\s*(\[[\s\S]*?\]);\s*\n/);
 if (!m) {
   console.log('status', res.status, 'length', html.length);
   console.log('title', (html.match(/<title>([^<]*)/) || [])[1]);
@@ -16,6 +16,7 @@ if (!m) {
   throw new Error('KTC playersArray not found (page format changed?)');
 }
 const arr = JSON.parse(m[1]);
+console.log('sample keys:', Object.keys(arr[0]).join(','), '| sf keys:', Object.keys(arr[0].superflexValues || {}).join(','));
 
 // Name matching against Sleeper IDs (FantasyCalc gives names + Sleeper IDs; Sleeper's player list covers the rest)
 const norm = s => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
