@@ -16,7 +16,9 @@ if (!m) {
   throw new Error('KTC playersArray not found (page format changed?)');
 }
 const arr = JSON.parse(m[1]);
-console.log('sample keys:', Object.keys(arr[0]).join(','), '| sf keys:', Object.keys(arr[0].superflexValues || {}).join(','));
+const sv0 = arr[0].superflexValues || {};
+console.log('history sample:', JSON.stringify(sv0.history || null).slice(0, 400), '| len', (sv0.history || []).length);
+console.log('tep sample:', JSON.stringify(sv0.tep || null).slice(0, 200));
 
 // Name matching against Sleeper IDs (FantasyCalc gives names + Sleeper IDs; Sleeper's player list covers the rest)
 const norm = s => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
@@ -25,7 +27,8 @@ const fc = await (await fetch('https://api.fantasycalc.com/values/current?isDyna
 const sleeper = await (await fetch('https://api.sleeper.app/v1/players/nfl')).json();
 const byKey = new Map();
 const add = (name, pos, id) => { const k = norm(name) + '|' + pos; if (!byKey.has(k)) byKey.set(k, String(id)); };
-for (const r of fc) if (r.player?.sleeperId) add(r.player.name, r.player.position, r.player.sleeperId);
+const byName = new Map();
+for (const r of fc) if (r.player?.sleeperId) { add(r.player.name, r.player.position, r.player.sleeperId); byName.set(norm(r.player.name), String(r.player.sleeperId)); }
 for (const [id, p] of Object.entries(sleeper)) if (p.active && ['QB', 'RB', 'WR', 'TE'].includes(p.position)) add(p.full_name || `${p.first_name} ${p.last_name}`, p.position, id);
 
 const values = {}, picks = [], unmatched = [];
@@ -36,7 +39,7 @@ for (const p of arr) {
   if (p.position === 'RDP' || /\b20\d\d\b/.test(p.playerName) && /(1st|2nd|3rd|4th|round|pick)/i.test(p.playerName)) {
     picks.push({ name: p.playerName, value: v }); continue;
   }
-  const id = byKey.get(norm(p.playerName) + '|' + p.position);
+  const id = byKey.get(norm(p.playerName) + '|' + p.position) || byName.get(norm(p.playerName));
   if (!id) { unmatched.push(p.playerName); continue; }
   values[id] = { v, tep, oneQB: one.value ?? null, name: p.playerName };
 }
