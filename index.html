@@ -373,6 +373,23 @@ const ENGINE = (() => {
 
   const STRAT_W = { winnow: { now: 1.0, fut: 0.25 }, middle: { now: 0.6, fut: 0.6 }, rebuild: { now: 0.12, fut: 1.0 } };
 
+  // How a team with a given strategy values an asset long-term.
+  // Rebuilders: older players are nearly worthless, QBs/WRs/picks are prized, RBs discounted.
+  // Contenders: picks are worth a bit less (they don't help this season).
+  const REBUILD_POS = { QB: 1.12, WR: 1.1, TE: 0.95, RB: 0.82 };
+  function stratFuture(a, strat) {
+    let f = a.future;
+    if (strat === 'rebuild') {
+      if (a.kind === 'pick') return f * 1.1;
+      if (a.ageMult < 0.9) f *= 0.35;
+      return f * (REBUILD_POS[a.pos] || 1);
+    }
+    if (strat === 'winnow' && a.kind === 'pick') return f * 0.85;
+    return f;
+  }
+  // Power mean on plain numbers (same consolidation logic as packageValue)
+  const pm = vals => Math.pow(vals.reduce((s, v) => s + Math.pow(Math.max(0, v), CONSOLIDATION_K), 0), 1 / CONSOLIDATION_K);
+
   // Effective market value of a package. Uses a power mean so one great asset beats several
   // middling ones: two 1,500s ≈ 2,300, not 3,000; two 4,000s ≈ 6,200, not 8,000.
   const CONSOLIDATION_K = 1.6;
@@ -433,13 +450,13 @@ const ENGINE = (() => {
           const theirAfterPlayers = t.players.filter(p => !rIds.has(p.id)).concat(G.filter(a => a.kind === 'player'));
           const theirAfter = lineupValue(theirAfterPlayers, model.slots).total;
           const theirNow = theirAfter - theirBefore;
-          const theirFut = G.reduce((s, a) => s + a.future, 0) - R.reduce((s, a) => s + a.future, 0);
+          const theirFut = pm(G.map(a => stratFuture(a, t.strategy))) - pm(R.map(a => stratFuture(a, t.strategy)));
           const partnerU = (w.now * theirNow + w.fut * theirFut) / 1000 - Math.max(0, diff) * 2.5;
           if (partnerU <= 0.15) continue;
           // My view
           const myAfterPlayers = myPlayersBefore.filter(p => !gIds.has(p.id)).concat(R.filter(a => a.kind === 'player'));
           const myNow = lineupValue(myAfterPlayers, model.slots).total - myLineupBefore;
-          const myFut = R.reduce((s, a) => s + myAssetScore(a), 0) - G.reduce((s, a) => s + a.future, 0);
+          const myFut = pm(R.map(myAssetScore)) - pm(G.map(a => stratFuture(a, me.strategy)));
           const myU = (myStrat.now * myNow + myStrat.fut * myFut) / 1000;
           if (myU <= 0.2) continue;
           const score = myU + 0.6 * Math.min(partnerU, 3) - 4 * Math.max(0, Math.abs(diff) - 0.04);
