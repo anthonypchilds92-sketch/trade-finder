@@ -1185,7 +1185,7 @@ function toggleOffers(tr) {
   } else if (nearest) {
     html = `<div class="card" style="margin:8px 0"><div class="small" style="margin-bottom:6px">No offer from your tradeable players gets a fair deal they'd want. The closest:</div>
       <div class="sides"><div class="side"><h4>You send</h4>${assetRows(nearest.give)}</div><div class="side"><h4>You get</h4>${assetRows(nearest.get)}</div></div>
-      <p class="small">Why it falls short: ${esc(nearest.fail || 'not enough in it for them')}. Try marking more players "Shop" in My team${prefs.protectPicks ? ', or allow your picks in Settings' : ''}.</p></div>`;
+      <p class="small">Why it falls short: ${esc(nearest.fail || 'not enough in it for them')}. Try marking more players "Shop" in My team${prefs.protectPicks ? ', or allow your picks in Settings' : ''}. You can still send it as a starting point.</p>${offerButton(nearest)}</div>`;
   } else {
     html = `<div class="card small" style="margin:8px 0">None of your tradeable players or picks are a fit for this one. Mark more players "Shop" in My team${prefs.protectPicks ? ', or allow your picks in Settings' : ''}.</div>`;
   }
