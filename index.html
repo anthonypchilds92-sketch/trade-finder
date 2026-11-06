@@ -555,7 +555,7 @@ const ENGINE = (() => {
     // A manager whose player dipped recently still anchors to the old price; after a long dip they let go.
     const anchored = a => a.buyLow ? 1 + a.dropPct * (1 - a.dipFatigue) : 1;
     return {
-      me, tol: prefs.fairness ?? 0.12, myAssetScore, anchored,
+      me, tol: prefs.fairness ?? 0.12, myAssetScore, anchored, even: prefs.evenDeals ?? 'prefer',
       myStrat: STRAT_W[me.strategy],
       myLineupBefore: lineupValue(me.players, model.slots).total,
       theirBefore: new Map(model.teams.map(t => [t.rosterId, lineupValue(t.players, model.slots)])),
@@ -598,6 +598,13 @@ const ENGINE = (() => {
       if (fp) { b += 0.15; res.tendency.push(`they often trade for ${fp.pos}s`); }
       res.partnerU += b;
     }
+    // Managers prefer deals with the same number of pieces each side (roster spots, and uneven deals feel lopsided)
+    res.imbalance = Math.abs(G.length - R.length);
+    if (res.imbalance && ctx.even === 'strict') return fail('uneven number of pieces');
+    if (res.imbalance && ctx.even === 'prefer') {
+      const likesIt = pr?.consol >= 0.5 && G.length < R.length; // a known consolidator doesn't mind
+      res.partnerU -= (likesIt ? 0.15 : 0.35) * res.imbalance;
+    }
     const myAfter = me.players.filter(p => !gIds.has(p.id)).concat(R.filter(a => a.kind === 'player'));
     res.myNow = lineupValue(myAfter, model.slots).total - ctx.myLineupBefore;
     res.myFut = pm(R.map(ctx.myAssetScore)) - pm(G.map(a => stratFuture(a, me.strategy)));
@@ -606,7 +613,8 @@ const ENGINE = (() => {
     if (res.myU <= (opts.minMine ?? 0.2)) return fail('not enough in it for you');
     // Managers who actually trade are worth more of your time
     const act = !pr || !model.tradeLog?.length ? 1 : pr.trades === 0 ? 0.85 : clamp(0.92 + 0.06 * pr.perSeason, 0.92, 1.12);
-    res.score = (res.myU + 0.6 * Math.min(res.partnerU, 3) - 4 * Math.max(0, Math.abs(diff) - 0.04)) * act;
+    const evenPen = ctx.even === 'prefer' ? 0.8 * res.imbalance : 0;
+    res.score = (res.myU + 0.6 * Math.min(res.partnerU, 3) - 4 * Math.max(0, Math.abs(diff) - 0.04) - evenPen) * act;
     return res;
   }
 
@@ -676,10 +684,15 @@ const ENGINE = (() => {
       .filter(a => a.value <= tv * 1.35 && a.value >= Math.min(250, tv * 0.2))
       .sort((a, b) => appeal(b) - appeal(a)).slice(0, 12);
     const sets = combos(pool, 3);
+    // To keep piece counts even, also try asking for a small extra piece back: one they'd miss least
+    const fillers = t.assets.filter(a => a.id !== target.id && a.value >= 150 && a.value <= tv * 0.5)
+      .sort((a, b) => appeal(a) - appeal(b)).slice(0, 8);
+    const getSets = [[target], ...fillers.map(f => [target, f])];
     const good = [], near = [];
-    for (const G of sets) {
-      const r = evaluate(model, ctx, t, G, [target], { minPartner: 0.1, minMine: 0 });
-      if (r.ok) { r.offerScore = 0.65 * Math.min(r.partnerU, 4) + 0.35 * r.myU - 3 * Math.abs(r.diff); good.push(r); }
+    for (const G of sets) for (const R of getSets) {
+      if (R.length > G.length) continue;
+      const r = evaluate(model, ctx, t, G, R, { minPartner: 0.1, minMine: 0 });
+      if (r.ok) { r.offerScore = 0.65 * Math.min(r.partnerU, 4) + 0.35 * r.myU - 3 * Math.abs(r.diff) - (ctx.even === 'prefer' ? 0.8 * r.imbalance : 0); good.push(r); }
       else if (r.partnerU != null) near.push(r);
     }
     good.sort((a, b) => b.offerScore - a.offerScore);
@@ -1045,6 +1058,8 @@ function renderSettings() {
   $('#tab-settings').innerHTML = `<div class="card">
     <label class="set"><span>Fairness range<div class="small">How far apart the two sides' market values can be</div></span>
       <select id="s-fair">${[0.06, 0.1, 0.12, 0.15, 0.2].map(v => `<option value="${v}" ${prefs.fairness == v ? 'selected' : ''}>±${Math.round(v * 100)}%</option>`).join('')}</select></label>
+    <label class="set"><span>Even deals<div class="small">Same number of pieces on each side</div></span>
+      <select id="s-even">${[['prefer', 'Prefer'], ['strict', 'Only even'], ['off', 'No preference']].map(([v, l]) => `<option value="${v}" ${(prefs.evenDeals ?? 'prefer') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     <label class="set"><span>Max assets per side</span>
       <select id="s-max">${[1, 2, 3].map(v => `<option ${prefs.maxAssets == v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
     <label class="set"><span>Target buy-low dips<div class="small">Prime-age stars whose value has dropped while their role hasn't</div></span><input type="checkbox" id="s-buylow" ${prefs.buyLow !== false ? 'checked' : ''}></label>
@@ -1058,6 +1073,7 @@ function renderSettings() {
     <p class="small">Data: Sleeper (rosters, picks, stats, trending adds) and <a href="https://fantasycalc.com" target="_blank" rel="noopener">FantasyCalc</a> (trade values). Settings are saved in this browser only.</p>
   </div>`;
   $('#s-fair').onchange = e => { prefs.fairness = +e.target.value; savePrefs(); rebuild(); };
+  $('#s-even').onchange = e => { prefs.evenDeals = e.target.value; savePrefs(); rebuild(); };
   $('#s-max').onchange = e => { prefs.maxAssets = +e.target.value; savePrefs(); rebuild(); };
   $('#s-inj').onchange = e => { prefs.injuryStash = e.target.checked; savePrefs(); rebuild(); };
   $('#s-win').onchange = e => { prefs.dipWindow = +e.target.value; savePrefs(); rebuild(); };
