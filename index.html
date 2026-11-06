@@ -373,10 +373,14 @@ const ENGINE = (() => {
 
   const STRAT_W = { winnow: { now: 1.0, fut: 0.25 }, middle: { now: 0.6, fut: 0.6 }, rebuild: { now: 0.12, fut: 1.0 } };
 
-  // Market value of a package: extra pieces are discounted (consolidation premium for the best asset)
+  // Effective market value of a package. Uses a power mean so one great asset beats several
+  // middling ones: two 1,500s ≈ 2,300, not 3,000; two 4,000s ≈ 6,200, not 8,000.
+  const CONSOLIDATION_K = 1.6;
   function packageValue(assets) {
-    return assets.map(a => a.value).sort((a, b) => b - a).reduce((s, v, i) => s + v * Math.pow(0.82, i), 0);
+    const k = CONSOLIDATION_K;
+    return Math.pow(assets.reduce((s, a) => s + Math.pow(Math.max(0, a.value), k), 0), 1 / k);
   }
+  const rawValue = assets => assets.reduce((s, a) => s + a.value, 0);
 
   function generateTrades(model, prefs) {
     const tol = prefs.fairness ?? 0.12;
@@ -418,6 +422,12 @@ const ENGINE = (() => {
           const rv = packageValue(R); if (rv < 600) continue;
           const diff = (rv - gv) / Math.max(rv, gv); // + means I receive more market value
           if (Math.abs(diff) > tol) continue;
+          // Nobody hands over the best piece in a deal and takes a discount on top.
+          const topGive = Math.max(...G.map(a => a.value)), topGet = Math.max(...R.map(a => a.value));
+          if (topGet > topGive && diff > 0.05) continue;   // they give the best piece: they must not lose value
+          if (topGive > topGet && diff < -0.05) continue;  // you give the best piece: you must not lose value
+          // No "three quarters for a dollar": the depth side's best piece must be a real asset
+          if (Math.min(topGive, topGet) < 0.5 * Math.max(topGive, topGet)) continue;
           // Partner's view
           const gIds = new Set(G.map(a => a.id)), rIds = new Set(R.map(a => a.id));
           const theirAfterPlayers = t.players.filter(p => !rIds.has(p.id)).concat(G.filter(a => a.kind === 'player'));
@@ -470,7 +480,8 @@ const ENGINE = (() => {
     for (const a of tr.get) why.push(`You get ${a.name}: ${assetReason(a)}`);
     for (const a of tr.give) if (a.kind === 'player') why.push(`You give ${a.name}: ${sellReason(a)}`);
     const pct = Math.round(tr.diff * 100);
-    why.push(`Market check: you give ${fmt(tr.gv)}, you get ${fmt(tr.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${pct}% their way`}).`);
+    const side = (list, eff) => list.length > 1 ? `${fmt(rawValue(list))} (worth ${fmt(eff)} as a package)` : fmt(eff);
+    why.push(`Market check: you give ${side(tr.give, tr.gv)}, you get ${side(tr.get, tr.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${pct}% their way`}).`);
     return why;
   }
   function assetReason(a) {
