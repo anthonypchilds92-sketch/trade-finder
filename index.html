@@ -63,6 +63,9 @@
   .seg button.on{color:#06121d;background:var(--accent);border-color:var(--accent)}
   .small{font-size:12px;color:var(--muted)}
   a{color:var(--accent)}
+  .chips{display:flex;flex-wrap:wrap;gap:6px}
+  .chip{background:var(--chip);border:1px solid var(--line);color:var(--text);border-radius:999px;padding:5px 10px;font-size:13px;cursor:pointer}
+  .chip.on{background:var(--accent);color:#06121d;border-color:var(--accent)} .chip.on .small{color:#06121d}
   tr.tap{cursor:pointer} tr.tap:hover td, tr.tap.open td{background:var(--panel2)}
   tr.tap td:first-child b::after{content:' ›';color:var(--muted);font-weight:400}
 </style>
@@ -83,6 +86,7 @@
       <button data-tab="targets">Targets</button>
       <button data-tab="myteam">My team</button>
       <button data-tab="league">League</button>
+      <button data-tab="evaluate">Evaluate</button>
       <button data-tab="offers">Offers</button>
       <button data-tab="settings">Settings</button>
     </nav>
@@ -97,6 +101,7 @@
   <section id="tab-targets" class="hidden"></section>
   <section id="tab-myteam" class="hidden"></section>
   <section id="tab-league" class="hidden"></section>
+  <section id="tab-evaluate" class="hidden"></section>
   <section id="tab-offers" class="hidden"></section>
   <section id="tab-settings" class="hidden"></section>
 </main>
@@ -607,11 +612,11 @@ const ENGINE = (() => {
     const diff = (rv - gv) / Math.max(rv, gv, 1); // + means I receive more market value
     const res = { partner: t, give: G, get: R, gv, rv, diff, ok: true, why: [] };
     const fail = m => { res.ok = false; res.fail = m; return res; };
-    if (Math.abs(diff) > tol) return fail(diff > 0 ? 'they lose too much market value' : 'you overpay');
+    if (Math.abs(diff) > tol) if (!opts.noChecks) return fail(diff > 0 ? 'they lose too much market value' : 'you overpay');
     const topGive = Math.max(...G.map(a => a.value)), topGet = Math.max(...R.map(a => a.value));
-    if (topGet > topGive && diff > 0.05) return fail('they give the best piece and lose value');
-    if (topGive > topGet && diff < -0.05) return fail('you give the best piece and lose value');
-    if (Math.min(topGive, topGet) < 0.5 * Math.max(topGive, topGet)) return fail('quantity for quality');
+    if (topGet > topGive && diff > 0.05) if (!opts.noChecks) return fail('they give the best piece and lose value');
+    if (topGive > topGet && diff < -0.05) if (!opts.noChecks) return fail('you give the best piece and lose value');
+    if (Math.min(topGive, topGet) < 0.5 * Math.max(topGive, topGet)) if (!opts.noChecks) return fail('quantity for quality');
     const w = STRAT_W[t.strategy];
     const before = ctx.theirBefore.get(t.rosterId);
     const gIds = new Set(G.map(a => a.id)), rIds = new Set(R.map(a => a.id));
@@ -639,7 +644,7 @@ const ENGINE = (() => {
     }
     // Managers prefer deals with the same number of pieces each side (roster spots, and uneven deals feel lopsided)
     res.imbalance = Math.abs(G.length - R.length);
-    if (res.imbalance && ctx.even === 'strict') return fail('uneven number of pieces');
+    if (res.imbalance && ctx.even === 'strict') if (!opts.noChecks) return fail('uneven number of pieces');
     if (res.imbalance && ctx.even === 'prefer') {
       const likesIt = pr?.consol >= 0.5 && G.length < R.length; // a known consolidator doesn't mind
       res.partnerU -= (likesIt ? 0.15 : 0.35) * res.imbalance;
@@ -651,7 +656,7 @@ const ENGINE = (() => {
     // What we've learned from offers you've sent
     const L = ctx.learn;
     if (L) {
-      if (L.rejectedKeys.has(offerKey(G, R))) return fail('they already turned this exact offer down');
+      if (L.rejectedKeys.has(offerKey(G, R))) if (!opts.noChecks) return fail('they already turned this exact offer down');
       res.learned = [];
       const bias = L.mgrBias[t.ownerId] || 0;
       if (bias) { res.partnerU -= bias; res.learned.push(bias > 0 ? 'they have turned down offers, so they likely need a bit more' : 'they have accepted offers from you before'); }
@@ -664,8 +669,8 @@ const ENGINE = (() => {
       if (dis) { res.partnerU -= dis; res.learned.push(`they didn't want ${G.filter(a => L.dislike[t.ownerId]?.[a.id]).map(a => a.name).join(', ')} last time`); }
     }
     if (opts.partnerBonus) res.partnerU += opts.partnerBonus;
-    if (res.partnerU <= (opts.minPartner ?? 0.15)) return fail('not enough in it for them');
-    if (res.myU <= (opts.minMine ?? 0.2)) return fail('not enough in it for you');
+    if (res.partnerU <= (opts.minPartner ?? 0.15)) if (!opts.noChecks) return fail('not enough in it for them');
+    if (res.myU <= (opts.minMine ?? 0.2)) if (!opts.noChecks) return fail('not enough in it for you');
     // Managers who actually trade are worth more of your time
     const act = !pr || !model.tradeLog?.length ? 1 : pr.trades === 0 ? 0.85 : clamp(0.92 + 0.06 * pr.perSeason, 0.92, 1.12);
     const evenPen = ctx.even === 'prefer' ? 0.8 * res.imbalance : 0;
@@ -724,6 +729,80 @@ const ENGINE = (() => {
       if (out.length >= (prefs.maxResults ?? 20)) break;
     }
     return out;
+  }
+
+  // ---- Evaluate an offer someone sent you ----
+  // giveIds: your assets they asked for; getIds: their assets they offered
+  function evaluateIncoming(model, prefs, rosterId, giveIds, getIds) {
+    const me = model.me, t = model.teamById.get(+rosterId);
+    const G = giveIds.map(id => me.assets.find(a => a.id === id)).filter(Boolean);
+    const R = getIds.map(id => t.assets.find(a => a.id === id)).filter(Boolean);
+    if (!t || !G.length || !R.length) return null;
+    const ctx = makeCtx(model, prefs);
+    const r = evaluate(model, ctx, t, G, R, { noChecks: true });
+    const mark = prefs.marks || {};
+    const flags = [];
+    for (const a of G) {
+      if (mark[a.id] === 'protect') flags.push(`${a.name} is marked Protect.`);
+      if (a.dip) flags.push(`${a.name} is in a dip (${Math.round(a.dropPct * 100)}% below his peak). Selling now is selling low.`);
+      if (a.injuredOut) flags.push(`${a.name} is ${a.injury}, so his price is at its lowest.`);
+      if (a.breakout >= 0.55 && a.kind === 'player') flags.push(`${a.name} has strong breakout signals.`);
+      if (a.kind === 'pick') flags.push(`You'd be giving up a pick (${a.name}).`);
+    }
+    for (const a of R) {
+      if (a.kind === 'player' && a.ageMult < 0.9) flags.push(`${a.name} is ${Math.floor(a.age)}. ${a.pos}s usually lose value from here, which is bad for a rebuild.`);
+      if (a.injuredOut && !a.injStash) flags.push(`${a.name} is ${a.injury} with a weaker recovery outlook.`);
+    }
+    const goods = [];
+    for (const a of R) {
+      if (a.buyLow) goods.push(`${a.name} is a buy-low (${Math.round(a.dropPct * 100)}% below peak, role intact).`);
+      if (a.injStash) goods.push(`${a.name} is an injury stash with a good recovery outlook.`);
+      if (a.kind === 'pick') goods.push(`You get a pick (${a.name}).`);
+      if (a.kind === 'player' && a.ageMult >= 1.05) goods.push(`${a.name} is young (${Math.floor(a.age)}) and should gain value.`);
+      if (a.breakout >= 0.55 && a.kind === 'player') goods.push(`${a.name} has strong breakout signals.`);
+    }
+    for (const a of G) if (a.kind === 'player' && a.sell >= 0.45 && !a.dip) goods.push(`Good time to sell ${a.name}: near his peak value.`);
+    // They sent it, so they want your players: you can hold out for a little more than market
+    const premium = 0.05;
+    const adjDiff = r.diff - premium;
+    const protectedHit = G.some(a => mark[a.id] === 'protect');
+    let verdict, tone;
+    if (r.myU >= 0.3 && adjDiff >= -0.03 && !protectedHit) { verdict = 'Accept'; tone = 'good'; }
+    else if (r.myU >= -0.25 && adjDiff >= -0.15) { verdict = 'Counter'; tone = 'warn'; }
+    else { verdict = 'Decline'; tone = 'bad'; }
+    // Counter-offers
+    const counters = [];
+    const want = t.assets.filter(a => !R.includes(a) && a.value >= 150 && (a.kind === 'pick' || a.ageMult >= 1 || a.breakout >= 0.45 || a.buyLow || a.injStash))
+      .sort((a, b) => a.value - b.value);
+    const target = packageValue(G) * (1 + premium);
+    // (a) ask for one more piece: the smallest that gets you to fair-plus-premium
+    for (const x of want) {
+      const R2 = R.concat([x]);
+      if (packageValue(R2) < target * 0.98) continue;
+      const c = evaluate(model, ctx, t, G, R2, { noChecks: true });
+      if (c.myU > r.myU && c.partnerU > -0.4) { counters.push({ kind: 'Ask for more', note: `Keep the deal and ask them to add ${x.name}.`, give: G, get: R2, r: c }); break; }
+    }
+    // (b) swap their weakest piece for a better one
+    if (R.length >= 1) {
+      const weakest = R.slice().sort((a, b) => ctx.myAssetScore(a) - ctx.myAssetScore(b))[0];
+      const rest = R.filter(a => a !== weakest);
+      for (const x of want.slice().reverse()) {
+        const R2 = rest.concat([x]);
+        const pv = packageValue(R2);
+        if (pv < target * 0.98 || pv > target * 1.2) continue;
+        const c = evaluate(model, ctx, t, G, R2, { noChecks: true });
+        if (c.myU > r.myU + 0.2 && c.partnerU > -0.4) { counters.push({ kind: 'Swap a piece', note: `Ask for ${x.name} instead of ${weakest.name}.`, give: G, get: R2, r: c }); break; }
+      }
+    }
+    // (c) take one of your pieces out
+    if (G.length > 1) {
+      for (const a of G.slice().sort((x, y) => y.value - x.value)) {
+        const G2 = G.filter(x => x !== a);
+        const c = evaluate(model, ctx, t, G2, R, { noChecks: true });
+        if (c.myU > r.myU && c.partnerU > -0.3) { counters.push({ kind: 'Give less', note: `Offer the same deal without ${a.name}.`, give: G2, get: R, r: c }); break; }
+      }
+    }
+    return { r, verdict, tone, flags, goods, counters, premium, team: t, G, R };
   }
 
   // ---- This week: who is short because of byes or injuries, and can I sell them a fix? ----
@@ -937,7 +1016,7 @@ const ENGINE = (() => {
   }
   const fmt = x => Math.round(x).toLocaleString('en-GB');
 
-  return { buildModel, generateTrades, offersFor, asksFor, weeklyNeeds, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
+  return { buildModel, generateTrades, offersFor, asksFor, weeklyNeeds, evaluateIncoming, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
 })();
 if (typeof module !== 'undefined') module.exports = ENGINE;
 /*ENGINE-END*/
@@ -1065,7 +1144,7 @@ function rebuild() {
   CARDS.length = 0;
   $('#title').textContent = RAW.league.name;
   $('#subtitle').textContent = `${MODEL.me.name} · ${MODEL.me.wins}–${MODEL.me.losses} · strategy: ${label(MODEL.me.strategy)}${RAW.week ? ` · week ${RAW.week}` : ''}`;
-  renderTrades(); renderWeek(); renderTargets(); renderMyTeam(); renderLeague(); renderOffers(); renderSettings();
+  renderTrades(); renderWeek(); renderTargets(); renderMyTeam(); renderLeague(); renderEvaluate(); renderOffers(); renderSettings();
 }
 const label = s => ({ winnow: 'Win now', middle: 'Middle', rebuild: 'Rebuild' }[s]);
 const stratPill = t => `<span class="pill ${t.strategy}">${label(t.strategy)}</span>`;
@@ -1122,6 +1201,53 @@ function renderWeek() {
   ${!wi ? '<div class="card small">This fills in after the first weekly round-up runs.</div>' : newST.length ? `<div class="card scroll"><table><tbody>${mini(newST)}</tbody></table></div>` : '<div class="card small">No new injury stashes since the last round-up.</div>'}`;
   bindOfferButtons(el);
   el.querySelectorAll('tr.tap').forEach(tr => tr.onclick = () => { document.querySelector('nav button[data-tab="targets"]').click(); const row = document.querySelector(`#tab-targets tr.tap[data-id="${tr.dataset.id}"]`); if (row) { row.scrollIntoView({ block: 'center' }); toggleOffers(row); } });
+}
+
+let EVAL = { team: '', give: new Set(), get: new Set() };
+function renderEvaluate() {
+  const el = $('#tab-evaluate');
+  const others = MODEL.teams.filter(t => t !== MODEL.me).sort((a, b) => a.name.localeCompare(b.name));
+  const t = EVAL.team ? MODEL.teamById.get(+EVAL.team) : null;
+  const chips = (assets, set, side) => assets.slice().sort((a, b) => b.value - a.value).filter(a => a.value >= 50 || set.has(a.id)).map(a =>
+    `<button class="chip ${set.has(a.id) ? 'on' : ''}" data-side="${side}" data-id="${esc(a.id)}">${esc(a.name)} <span class="small">${a.kind === 'pick' ? '' : esc(a.pos) + ' · '}${fmt(a.value)}</span></button>`).join('');
+  el.innerHTML = `<p class="small">Got an offer? Pick the team, tick what they want from you and what they're offering, and you'll get a verdict and a counter-offer.</p>
+    <div class="card"><div class="row"><select id="ev-team"><option value="">Who sent it?</option>${others.map(x => `<option value="${x.rosterId}" ${String(x.rosterId) === String(EVAL.team) ? 'selected' : ''}>${esc(x.name)} (${label(x.strategy)})</option>`).join('')}</select>
+      ${EVAL.give.size || EVAL.get.size ? '<button class="btn ghost" id="ev-clear" style="padding:4px 10px">Clear</button>' : ''}</div>
+    ${t ? `<h4 class="small" style="margin:12px 0 6px;text-transform:uppercase;letter-spacing:.06em">They want from you</h4><div class="chips">${chips(MODEL.me.assets, EVAL.give, 'give')}</div>
+      <h4 class="small" style="margin:14px 0 6px;text-transform:uppercase;letter-spacing:.06em">They're offering</h4><div class="chips">${chips(t.assets, EVAL.get, 'get')}</div>` : ''}</div>
+    <div id="ev-out"></div>`;
+  $('#ev-team').onchange = e => { EVAL = { team: e.target.value, give: new Set(), get: new Set() }; renderEvaluate(); };
+  if ($('#ev-clear')) $('#ev-clear').onclick = () => { EVAL.give.clear(); EVAL.get.clear(); renderEvaluate(); };
+  el.querySelectorAll('button.chip').forEach(b => b.onclick = () => {
+    const set = b.dataset.side === 'give' ? EVAL.give : EVAL.get;
+    set.has(b.dataset.id) ? set.delete(b.dataset.id) : set.add(b.dataset.id);
+    const y = window.scrollY; renderEvaluate(); window.scrollTo(0, y);
+  });
+  if (!t || !EVAL.give.size || !EVAL.get.size) return;
+  const res = ENGINE.evaluateIncoming(MODEL, P(), t.rosterId, [...EVAL.give], [...EVAL.get]);
+  if (!res) return;
+  const { r } = res;
+  const col = { good: 'var(--good)', warn: 'var(--warn)', bad: 'var(--bad)' }[res.tone];
+  const pct = Math.round(r.diff * 100);
+  const why = [
+    `Market: you give ${fmt(r.gv)}, you get ${fmt(r.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${-pct}% their way`}). They came to you, so aim for at least +${Math.round(res.premium * 100)}%.`,
+    r.myFut > 0 ? `Long-term value for your rebuild: up about ${fmt(r.myFut)}.` : `Long-term value for your rebuild: down about ${fmt(-r.myFut)}.`,
+  ];
+  const counterCard = c => { const pc = Math.round(c.r.diff * 100); return `<div class="card" style="margin:8px 0"><div class="small" style="margin-bottom:6px"><b>${esc(c.kind)}</b> · ${esc(c.note)}</div>
+    <div class="sides"><div class="side"><h4>You give</h4>${assetRows(c.give)}</div><div class="side"><h4>You get</h4>${assetRows(c.get)}</div></div>
+    <div class="small" style="margin-top:6px">Market ${pc === 0 ? 'even' : pc > 0 ? `+${pc}% your way` : `${-pc}% their way`}.</div>${offerButton(Object.assign(c.r, { partner: res.team }))}</div>`; };
+  $('#ev-out').innerHTML = `<div class="card"><div class="trade-top"><span style="font-size:20px;font-weight:700;color:${col}">${res.verdict}</span><span class="pill">${esc(res.team.name)} · ${label(res.team.strategy)}</span></div>
+    <ul class="why">${why.map(w => `<li>${esc(w)}</li>`).join('')}${res.goods.map(w => `<li style="color:var(--good)">${esc(w)}</li>`).join('')}${res.flags.map(w => `<li style="color:var(--warn)">${esc(w)}</li>`).join('')}</ul>
+    <div class="row" style="margin-top:10px"><button class="btn ghost" id="ev-log">Log interest in my players</button></div></div>
+    ${res.counters.length ? `<h3 style="margin:14px 0 4px;font-size:16px">${res.verdict === 'Accept' ? 'You could still try' : 'Counter-offers'}</h3>${res.counters.map(counterCard).join('')}` : res.verdict === 'Decline' ? '<div class="card small">No simple counter from their roster closes the gap. Declining is reasonable.</div>' : res.verdict === 'Counter' ? '<div class="card small">Close, but no single change from their roster fixes it. Ask them to improve the offer, or name what you\'d want.</div>' : ''}`;
+  bindOfferButtons($('#ev-out'));
+  $('#ev-log').onclick = () => {
+    const day = new Date().toISOString().slice(0, 10);
+    for (const a of res.G) if (a.kind === 'player' && !INTEREST.some(i => i.playerId === a.id && i.ownerId === res.team.ownerId && i.day === day))
+      INTEREST.unshift({ ts: Date.now(), day, ownerId: res.team.ownerId, teamName: res.team.name, playerId: a.id, playerName: a.name });
+    saveInterest(); LEARN = ENGINE.learnFromOffers(OFFERS, INTEREST); renderOffers();
+    $('#ev-log').outerHTML = '<span class="pill" style="color:var(--good)">Interest logged</span>';
+  };
 }
 
 function renderTargets() {
