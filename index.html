@@ -549,8 +549,13 @@ const ENGINE = (() => {
   // ---- Learning from offers you've sent ----
   // offers: [{ownerId, partnerName, give:[{id,name,value}], get:[...], status:'open'|'accepted'|'rejected'|'withdrawn', reason}]
   const offerKey = (give, get) => give.map(a => a.id).sort().join(',') + '|' + get.map(a => a.id).sort().join(',');
-  function learnFromOffers(offers) {
-    const L = { mgrBias: {}, premium: {}, dislike: {}, rejectedKeys: new Set(), offeredKeys: new Set(), notes: {} };
+  function learnFromOffers(offers, interest = []) {
+    const L = { mgrBias: {}, premium: {}, dislike: {}, rejectedKeys: new Set(), offeredKeys: new Set(), notes: {}, wants: {}, demand: {} };
+    // Interest in your players: that manager values him more; a little more demand league-wide too
+    for (const i of interest) {
+      (L.wants[i.ownerId] ??= {})[i.playerId] = true;
+      L.demand[i.playerId] = clamp((L.demand[i.playerId] || 0) + 0.05, 0, 0.15);
+    }
     const add = (o, k, v, lo, hi) => { o[k] = clamp((o[k] || 0) + v, lo, hi); };
     const note = (owner, txt) => (L.notes[owner] ??= []).push(txt);
     for (const o of offers || []) {
@@ -650,6 +655,9 @@ const ENGINE = (() => {
       if (bias) { res.partnerU -= bias; res.learned.push(bias > 0 ? 'they have turned down offers, so they likely need a bit more' : 'they have accepted offers from you before'); }
       const prem = R.reduce((s, a) => s + (L.premium[a.id] || 0) * a.value, 0) / 1000;
       if (prem) { res.partnerU -= prem; res.learned.push(`${R.filter(a => L.premium[a.id]).map(a => a.name).join(', ')} is valued above market by managers`); }
+      const wanted = G.filter(a => L.wants[t.ownerId]?.[a.id]);
+      const pull = G.reduce((s, a) => s + ((L.wants[t.ownerId]?.[a.id] ? 0.2 : 0) + (L.demand[a.id] || 0)) * a.value, 0) / 1000;
+      if (pull) { res.partnerU += pull; if (wanted.length) res.learned.push(`they asked about ${wanted.map(a => a.name).join(', ')}`); }
       const dis = G.reduce((s, a) => s + (L.dislike[t.ownerId]?.[a.id] || 0) * a.value, 0) / 1000;
       if (dis) { res.partnerU -= dis; res.learned.push(`they didn't want ${G.filter(a => L.dislike[t.ownerId]?.[a.id]).map(a => a.name).join(', ')} last time`); }
     }
@@ -713,6 +721,50 @@ const ENGINE = (() => {
       if (out.length >= (prefs.maxResults ?? 20)) break;
     }
     return out;
+  }
+
+  // Someone asked about one of my players: what should I ask for back from that team?
+  function asksFor(model, prefs, myAssetId, rosterId) {
+    const me = model.me;
+    const a = me.assets.find(x => x.id === myAssetId);
+    const t = model.teamById.get(+rosterId);
+    if (!a || !t) return null;
+    const ctx = makeCtx(model, prefs);
+    const mark = (prefs.marks || {})[a.id];
+    // Price basis: today's value, or his likely recovery value if he's in a dip or injured
+    let basis = a.value; const notes = [];
+    if (a.dip && a.peakValue > a.value) { basis = Math.max(basis, a.value + (a.peakValue - a.value) * 0.8); notes.push(`he's in a dip, so you're pricing him near his ${fmt(a.peakValue)} peak, not today's ${fmt(a.value)}`); }
+    if (a.injuredOut && a.injRebound) { basis = Math.max(basis, a.injRebound / Math.max(0.5, a.ageMult)); notes.push(`he's ${a.injury}, so you're pricing him on his healthy value`); }
+    let mult = 1.05; notes.unshift('they came to you, so start above market (+5%)');
+    if (mark === 'protect') { mult += 0.25; notes.push("you've marked him Protect, so it should take a clear overpay (+25%)"); }
+    if (a.dip) { mult += 0.1; notes.push('selling in a dip needs compensating (+10%)'); }
+    if (a.breakout >= 0.55 && a.kind === 'player') { mult += 0.1; notes.push('he has strong breakout signals (+10%)'); }
+    if (a.kind === 'player' && a.ageMult >= 1.05) { mult += 0.05; notes.push('he is young enough to keep gaining value (+5%)'); }
+    const floor = basis * mult;
+    // What I'd want back from them (young / breakout / picks / buy-lows), within a sensible range
+    // Rebuild-friendly assets first; only widen to near-peak players if they have too few
+    const fits = x => x.kind === 'pick' || x.ageMult >= 1 || x.breakout >= 0.45 || x.buyLow || x.injStash;
+    let pool = t.assets.filter(x => x.value >= 200 && x.value <= floor * 1.4 && (me.strategy !== 'rebuild' || fits(x)));
+    if (pool.length < 3) pool = t.assets.filter(x => x.value >= 200 && x.value <= floor * 1.4 && x.ageMult >= 0.9);
+    pool = pool.sort((x, y) => ctx.myAssetScore(y) - ctx.myAssetScore(x)).slice(0, 14);
+    const theirBefore = ctx.theirBefore.get(t.rosterId).total;
+    const cands = [];
+    for (const R of combos(pool, 2)) {
+      const rv = packageValue(R);
+      if (rv < floor * 0.97 || rv > floor * 1.45) continue;
+      const rIds = new Set(R.map(x => x.id));
+      const theirAfter = lineupValue(t.players.filter(p => !rIds.has(p.id)).concat(a.kind === 'player' ? [a] : []), model.slots).total;
+      const myGain = pm(R.map(ctx.myAssetScore)) - stratFuture(a, me.strategy);
+      const evenPen = R.length > 1 ? 0.15 : 0;
+      cands.push({ get: R, rv, myGain, theirNow: theirAfter - theirBefore, score: myGain / 1000 - evenPen - Math.max(0, (rv - floor * 1.1) / floor) });
+    }
+    cands.sort((x, y) => y.score - x.score);
+    const pick = (lo, hi, exclude) => cands.find(c => c.rv >= floor * lo && c.rv <= floor * hi && !exclude.some(e => e.get.some(g => c.get.includes(g))));
+    const chosen = [];
+    const open = pick(1.1, 1.45, chosen); if (open) chosen.push(Object.assign(open, { label: 'Opening ask', hint: 'Start here, since they came to you.' }));
+    const settle = pick(0.97, 1.12, chosen); if (settle) chosen.push(Object.assign(settle, { label: 'Where to settle', hint: "A fair landing spot if they counter." }));
+    const pk = cands.find(c => c.get.some(g => g.kind === 'pick') && !chosen.includes(c)); if (pk) chosen.push(Object.assign(pk, { label: 'Picks option', hint: 'Mostly future value, which suits a rebuild.' }));
+    return { asset: a, team: t, basis, floor, notes, asks: chosen };
   }
 
   // Offers built around one specific target: what could I send his manager that they'd like?
@@ -837,7 +889,7 @@ const ENGINE = (() => {
   }
   const fmt = x => Math.round(x).toLocaleString('en-GB');
 
-  return { buildModel, generateTrades, offersFor, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
+  return { buildModel, generateTrades, offersFor, asksFor, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
 })();
 if (typeof module !== 'undefined') module.exports = ENGINE;
 /*ENGINE-END*/
@@ -858,6 +910,8 @@ let prefs = Object.assign({ fairness: 0.12, maxAssets: 2, protectPicks: true, ma
 const savePrefs = () => store.set('prefs', prefs);
 let RAW = null, MODEL = null;
 let OFFERS = store.get('offers', []);
+let INTEREST = store.get('interest', []);
+const saveInterest = () => store.set('interest', INTEREST);
 const saveOffers = () => store.set('offers', OFFERS);
 let LEARN = null;
 const P = () => Object.assign({}, prefs, { learn: LEARN });
@@ -958,7 +1012,7 @@ async function load(force) {
 function rebuild() {
   MODEL = ENGINE.buildModel(RAW, prefs);
   autoDetectAccepted();
-  LEARN = ENGINE.learnFromOffers(OFFERS);
+  LEARN = ENGINE.learnFromOffers(OFFERS, INTEREST);
   CARDS.length = 0;
   $('#title').textContent = RAW.league.name;
   $('#subtitle').textContent = `${MODEL.me.name} · ${MODEL.me.wins}–${MODEL.me.losses} · strategy: ${label(MODEL.me.strategy)}${RAW.week ? ` · week ${RAW.week}` : ''}`;
@@ -1129,6 +1183,8 @@ function renderOffers() {
   el.innerHTML = `<p class="small">Tap "I've sent this offer" on any suggested trade or tapped-player offer to log it here. Mark the result when you hear back, and future suggestions adjust. If an offer goes through on Sleeper, it's marked accepted automatically.</p>
     <h3 style="margin:14px 0 4px;font-size:16px">Open (${open.length})</h3>
     ${open.length ? open.map(o => card(o, OFFERS.indexOf(o))).join('') : '<div class="card small">No open offers.</div>'}
+    <h3 style="margin:18px 0 4px;font-size:16px">Interest in your players (${INTEREST.length})</h3>
+    ${INTEREST.length ? `<div class="card">${INTEREST.slice(0, 20).map((i, k) => `<div class="row" style="justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--line)"><span><b>${esc(i.teamName)}</b> asked about ${esc(i.playerName)} <span class="small">· ${new Date(i.ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}</span></span><button class="btn ghost" data-rmint="${k}" style="padding:2px 8px;font-size:12px">Remove</button></div>`).join('')}<p class="small">Each enquiry makes that player worth a bit more to the team that asked, and slightly more to everyone.</p></div>` : '<div class="card small">Log interest from the Interest? button in My team.</div>'}
     <h3 style="margin:18px 0 4px;font-size:16px">What the model has learned</h3>
     <div class="card">${learnRows.length || premRows.length ? `<ul class="why" style="margin:0">${learnRows.join('')}${premRows.join('')}</ul>` : '<div class="small">Nothing yet. Results from your offers will show here.</div>'}</div>
     <h3 style="margin:18px 0 4px;font-size:16px">History (${closed.length})</h3>
@@ -1144,13 +1200,50 @@ function renderOffers() {
     else { o.status = act; o.closedTs = Date.now(); if (b.dataset.reason) o.reason = b.dataset.reason; }
     saveOffers(); rebuild();
   });
+  el.querySelectorAll('button[data-rmint]').forEach(b => b.onclick = () => { INTEREST.splice(+b.dataset.rmint, 1); saveInterest(); rebuild(); });
   $('#o-copy').onclick = async () => {
-    try { await navigator.clipboard.writeText(JSON.stringify(OFFERS)); $('#o-msg').textContent = 'Copied.'; }
-    catch { $('#o-import').value = JSON.stringify(OFFERS); $('#o-msg').textContent = 'Couldn\'t copy automatically. The data is in the box, so select it and copy.'; }
+    try { await navigator.clipboard.writeText(JSON.stringify({ offers: OFFERS, interest: INTEREST })); $('#o-msg').textContent = 'Copied.'; }
+    catch { $('#o-import').value = JSON.stringify({ offers: OFFERS, interest: INTEREST }); $('#o-msg').textContent = 'Couldn\'t copy automatically. The data is in the box, so select it and copy.'; }
   };
   $('#o-restore').onclick = () => {
-    try { const v = JSON.parse($('#o-import').value); if (!Array.isArray(v)) throw 0; OFFERS = v; saveOffers(); rebuild(); $('#o-msg').textContent = 'Restored.'; }
+    try { const v = JSON.parse($('#o-import').value); if (Array.isArray(v)) OFFERS = v; else if (v && Array.isArray(v.offers)) { OFFERS = v.offers; INTEREST = v.interest || []; saveInterest(); } else throw 0; saveOffers(); rebuild(); $('#o-msg').textContent = 'Restored.'; }
     catch { $('#o-msg').textContent = "That doesn't look like offer data."; }
+  };
+}
+
+function toggleInterest(btn) {
+  const tr = btn.closest('tr');
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains('offer-row')) { next.remove(); return; }
+  document.querySelectorAll('#tab-myteam .offer-row').forEach(r => r.remove());
+  const id = btn.dataset.id;
+  const a = MODEL.me.assets.find(x => x.id === id);
+  const others = MODEL.teams.filter(t => t !== MODEL.me).sort((x, y) => x.name.localeCompare(y.name));
+  const row = document.createElement('tr'); row.className = 'offer-row';
+  row.innerHTML = `<td colspan="4" style="background:var(--bg)"><div class="card" style="margin:8px 0">
+    <div class="small" style="margin-bottom:6px">Who asked about <b>${esc(a.name)}</b>, or sent you an offer for him?</div>
+    <div class="row"><select class="int-team"><option value="">Choose a team…</option>${others.map(t => `<option value="${t.rosterId}">${esc(t.name)} (${label(t.strategy)})</option>`).join('')}</select></div>
+    <div class="int-out" style="margin-top:8px"></div></div></td>`;
+  tr.after(row);
+  row.querySelector('.int-team').onchange = e => {
+    const rid = e.target.value; if (!rid) return;
+    const team = MODEL.teamById.get(+rid);
+    // Log the interest (once per team, player and day)
+    const day = new Date().toISOString().slice(0, 10);
+    if (!INTEREST.some(i => i.playerId === id && i.ownerId === team.ownerId && i.day === day)) {
+      INTEREST.unshift({ ts: Date.now(), day, ownerId: team.ownerId, teamName: team.name, playerId: id, playerName: a.name });
+      saveInterest(); LEARN = ENGINE.learnFromOffers(OFFERS, INTEREST); renderOffers();
+      btn.textContent = `Interest? (${INTEREST.filter(i => i.playerId === id).length})`;
+    }
+    const res = ENGINE.asksFor(MODEL, P(), id, rid);
+    const out = row.querySelector('.int-out');
+    if (!res) { out.innerHTML = '<div class="small">Something went wrong building asks.</div>'; return; }
+    out.innerHTML = `<div class="small">Logged: ${esc(team.name)} are interested in ${esc(a.name)}. Market value ${fmt(a.value)}, <b>ask for at least about ${fmt(res.floor)}</b> in value:</div>
+      <ul class="why">${res.notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul>
+      ${res.asks.length ? res.asks.map(c => `<div class="card" style="margin:8px 0"><div class="small" style="margin-bottom:6px"><b>${c.label}</b> · ${esc(c.hint)}</div>
+        <div class="side"><h4>Ask ${esc(team.name)} for</h4>${c.get.map(g => `<div class="asset"><div><div class="nm">${esc(g.name)}${g.injStash ? '<span class="tag hot">injury stash</span>' : g.buyLow ? '<span class="tag buy">buy low</span>' : g.breakout >= 0.55 && g.kind === 'player' ? '<span class="tag hot">breakout</span>' : ''}</div><div class="meta">${esc(assetMeta(g))}</div></div><div class="val">${fmt(g.value)}</div></div>`).join('')}</div>
+        <div class="small" style="margin-top:6px">Package worth about ${fmt(c.rv)}, or ${c.rv >= a.value ? '+' : ''}${Math.round((c.rv / a.value - 1) * 100)}% on his market value.${c.theirNow < -200 && team.strategy === 'winnow' ? ' Note: this weakens their lineup, so a contender may push back.' : ''}</div></div>`).join('')
+      : `<div class="small">${esc(team.name)} don't have young players or picks worth enough to meet your ask. Holding him is reasonable, or ask them to name an offer first.</div>`}`;
   };
 }
 
@@ -1175,8 +1268,9 @@ function renderMyTeam() {
   $('#tab-myteam').innerHTML = `<p class="small"><b>Protect</b> keeps a player out of every trade, and <b>Shop</b> forces him into the trade search. <b>Auto</b> lets the site decide: it shops players near their value peak who are past their age peak or whose value is mostly about this season. It won't sell anyone whose value is falling. "Dip · hold" marks a player whose value has dropped while his role hasn't, which is a bad time to sell.</p>
   <div class="card scroll"><table><thead><tr><th>Asset</th><th class="n">Value</th><th class="n">2-yr</th><th>Trade?</th></tr></thead><tbody>
   ${rows.map(a => `<tr><td><b>${esc(a.name)}</b>${tags(a)}<div class="small">${esc(assetMeta(a))}${a.injury ? ' · ' + esc(a.injury) : ''}</div></td>
-  <td class="n">${fmt(a.value)}</td><td class="n" style="color:${a.ageMult >= 1 ? 'var(--good)' : a.ageMult < 0.8 ? 'var(--bad)' : 'var(--muted)'}">${fmt(a.future)}</td><td>${markBtns(a)}</td></tr>`).join('')}
+  <td class="n">${fmt(a.value)}</td><td class="n" style="color:${a.ageMult >= 1 ? 'var(--good)' : a.ageMult < 0.8 ? 'var(--bad)' : 'var(--muted)'}">${fmt(a.future)}</td><td>${markBtns(a)}<div style="margin-top:4px"><button class="btn ghost interest" data-id="${esc(a.id)}" style="padding:2px 8px;font-size:12px">Interest?${INTEREST.some(i => i.playerId === a.id) ? ` (${INTEREST.filter(i => i.playerId === a.id).length})` : ''}</button></div></td></tr>`).join('')}
   </tbody></table><p class="small">"2-yr" is the value we expect him to have in about two years, based on his age and position.</p></div>`;
+  $('#tab-myteam').querySelectorAll('button.interest').forEach(b => b.onclick = () => toggleInterest(b));
   $('#tab-myteam').querySelectorAll('.seg button').forEach(b => b.onclick = () => {
     const id = b.parentElement.dataset.id; const m = b.dataset.m;
     if (m === 'auto') delete prefs.marks[id]; else prefs.marks[id] = m;
