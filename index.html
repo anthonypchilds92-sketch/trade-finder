@@ -264,8 +264,17 @@ const ENGINE = (() => {
   // ---- Trade history: what each manager tends to do ----
   // tradeHistory = [{ season, rosters: [{roster_id, owner_id}], txns: [...] }]
   // Values are today's FantasyCalc values (a guide to what moved, not what it was worth at the time).
-  function buildTendencies(tradeHistory, teams, { fcById, sleeperPlayers, pickValue }) {
+  function buildTendencies(tradeHistory, teams, { fcById, sleeperPlayers, pickValue, history }) {
     const log = [];
+    // Value on the day of the trade, from the saved daily history (null if the trade predates it)
+    const hDates = (history?.dates || []).map(d => Date.parse(d));
+    const valueAt = (key, when) => {
+      if (!when || !hDates.length || when < hDates[0] - 86400000) return null;
+      const vals = history.values?.[key]; if (!vals) return null;
+      let i = hDates.length - 1; while (i > 0 && hDates[i] > when) i--;
+      for (let j = i; j >= 0 && j >= i - 3; j--) if (vals[j] != null) return vals[j];
+      return null;
+    };
     for (const t of teams) t.profile = { trades: 0, seasons: new Set(), partners: {}, picksIn: 0, picksOut: 0, piecesIn: 0, piecesOut: 0, ageIn: [0, 0], ageOut: [0, 0], posIn: {}, valIn: 0, valOut: 0, tags: [], favPos: [], perSeason: 0, pickNet: 0, consol: 0, ageNet: 0 };
     if (!tradeHistory?.length) return log;
     const byOwner = new Map(teams.map(t => [t.ownerId, t]));
@@ -282,15 +291,18 @@ const ENGINE = (() => {
           const f = fcById.get(String(id)), sp = sleeperPlayers?.[id] || {};
           const age = f?.player.maybeAge ?? sp.age;
           return { kind: 'player', id: String(id), name: f?.player.name || sp.full_name || `Player ${id}`, pos: f?.player.position || sp.position || '?',
-            value: f?.value ?? 0, age: age != null ? +age - yearsAgo : null };
+            value: f?.value ?? 0, then: valueAt(String(id), when), age: age != null ? +age - yearsAgo : null };
         };
         for (const [id, rid] of Object.entries(tx.adds || {})) sides[rid]?.got.push(pl(id));
         for (const [id, rid] of Object.entries(tx.drops || {})) sides[rid]?.gave.push(pl(id));
         for (const dp of tx.draft_picks || []) {
-          const pk = { kind: 'pick', name: `${dp.season} round ${dp.round}`, value: pickValue(String(dp.season), dp.round, 'generic'), pos: 'PICK' };
+          const pk = { kind: 'pick', name: `${dp.season} round ${dp.round}`, value: pickValue(String(dp.season), dp.round, 'generic'), then: valueAt(`pick:${dp.season}:${dp.round}`, when), pos: 'PICK' };
           sides[dp.owner_id]?.got.push(pk); sides[dp.previous_owner_id]?.gave.push(pk);
         }
         const entry = { when, season: set.season, sides: [] };
+        const allAssets = Object.values(sides).flatMap(sd => [...sd.got, ...sd.gave]);
+        // Graded "at the time" only if we have a saved value for (nearly) everything that moved
+        entry.atTime = allAssets.length > 0 && allAssets.filter(a => a.then != null || a.value < 200).length === allAssets.length;
         for (const [rid, sd] of Object.entries(sides)) {
           const team = byOwner.get(ownerOf.get(+rid));
           entry.sides.push({ team, teamName: team?.name || 'Former manager', ...sd });
@@ -548,7 +560,7 @@ const ENGINE = (() => {
       t.assets = [...t.playerIds.map(id => players.get(id)), ...[...picks.values()].filter(p => p.owner === t.rosterId)];
       t.players = t.assets.filter(a => a.kind === 'player');
     }
-    const tradeLog = buildTendencies(input.tradeHistory, teams, { fcById, sleeperPlayers, pickValue });
+    const tradeLog = buildTendencies(input.tradeHistory, teams, { fcById, sleeperPlayers, pickValue, history: input.history });
     return { league, slots, season, teams, teamById, players, picks, me, haveStats, haveTrending: trendMap.size > 0, histSpan: hist?.span || 0, tradeLog,
       fcById, sleeperPlayers, trendMap, statMap, maxTrend, rostered: new Set(teams.flatMap(t => t.playerIds)) };
   }
@@ -1702,22 +1714,31 @@ function renderLeague() {
   const gradeOf = pct => pct >= 0.3 ? 'A+' : pct >= 0.15 ? 'A' : pct >= 0.05 ? 'B+' : pct > -0.05 ? 'B' : pct > -0.15 ? 'C' : pct > -0.3 ? 'D' : 'F';
   const gradeCol = g => g.startsWith('A') ? 'var(--good)' : g === 'B+' || g === 'B' ? 'var(--accent)' : g === 'C' ? 'var(--warn)' : 'var(--bad)';
   const record = new Map();
+  const thenVal = l => ENGINE.packageValue(l.map(a => ({ value: a.then ?? a.value })));
   for (const e of log) {
     for (const sd of e.sides) {
-      const got = ENGINE.packageValue(sd.got), gave = ENGINE.packageValue(sd.gave);
+      // Hindsight (today's values)
+      const gotN = ENGINE.packageValue(sd.got), gaveN = ENGINE.packageValue(sd.gave);
+      sd.netNow = gotN - gaveN; sd.pctNow = sd.netNow / Math.max(gotN, gaveN, 1); sd.gradeNow = gradeOf(sd.pctNow);
+      // At the time of the trade, when the daily history covers it
+      const got = e.atTime ? thenVal(sd.got) : gotN, gave = e.atTime ? thenVal(sd.gave) : gaveN;
       sd.net = got - gave; sd.pct = sd.net / Math.max(got, gave, 1); sd.grade = gradeOf(sd.pct);
       if (sd.team) { const r = record.get(sd.team) || { w: 0, l: 0, d: 0, net: 0 }; Math.abs(sd.pct) < 0.05 ? r.d++ : sd.net > 0 ? r.w++ : r.l++; r.net += sd.net; record.set(sd.team, r); }
     }
     const best = e.sides.slice().sort((a, b) => b.net - a.net)[0];
-    e.verdict = Math.abs(best.pct) < 0.05 ? 'Even trade, nobody clearly won' : `${best.teamName} won by ${fmt(best.net)} (${Math.round(best.pct * 100)}%)`;
+    e.verdict = (e.atTime ? 'At the time: ' : '') + (Math.abs(best.pct) < 0.05 ? 'even trade' : `${best.teamName} won by ${fmt(best.net)} (${Math.round(best.pct * 100)}%)`);
+    if (e.atTime) {
+      const bestNow = e.sides.slice().sort((a, b) => b.netNow - a.netNow)[0];
+      e.hindsight = Math.abs(bestNow.pctNow) < 0.05 ? 'With hindsight: about even now' : `With hindsight: ${bestNow.teamName} ahead by ${fmt(bestNow.netNow)} (${Math.round(bestNow.pctNow * 100)}%)`;
+    }
   }
   const profHtml = `<h3 style="margin:18px 0 4px;font-size:16px">Manager trade tendencies</h3>
   <p class="small">${log.length ? `From ${log.length} completed trade${log.length === 1 ? '' : 's'} (${seasons.join(', ')}). These tendencies feed into the trade scores, and managers who trade more often rank a little higher. Values are today's, so they show what kind of assets moved, not what they were worth at the time.` : 'No completed trades found in this league yet. Profiles will fill in as trades happen.'}</p>
   ${log.length ? `<div class="card">${MODEL.teams.slice().sort((a, b) => b.profile.trades - a.profile.trades).map(t => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(t.name)}</b>${t === MODEL.me ? ' <span class="tag buy">you</span>' : ''} <span class="small">· ${t.profile.trades} trade${t.profile.trades === 1 ? '' : 's'}${record.get(t) ? ` · record ${record.get(t).w}–${record.get(t).l}${record.get(t).d ? '–' + record.get(t).d : ''} · net ${record.get(t).net >= 0 ? '+' : ''}${fmt(record.get(t).net)}` : ''}</span><div>${t.profile.tags.map(g => `<span class="pill" style="margin:3px 4px 0 0">${esc(g)}</span>`).join('')}</div></div>`).join('')}</div>
   <h3 style="margin:18px 0 4px;font-size:16px">Recent trades</h3>
-  <p class="small">Graded on today's values, with hindsight: what each side got against what they gave, adjusted so a 2-for-1 is judged fairly. A+ means a clear win, B is about even, F is a fleecing. Record is wins–losses(–evens).</p>
-  ${log.slice(0, 12).map(e => `<div class="card"><div class="trade-top"><span class="small">${e.when ? new Date(e.when).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : e.season}</span><span class="small"><b>${esc(e.verdict)}</b></span></div>
-    <div class="sides">${e.sides.map(sd => `<div class="side"><h4 style="display:flex;justify-content:space-between"><span>${esc(sd.teamName)} got</span><span style="font-size:18px;color:${gradeCol(sd.grade)};letter-spacing:0">${sd.grade}</span></h4>${sd.got.length ? sd.got.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}</div><div class="meta">${a.kind === 'pick' ? 'Draft pick' : esc(a.pos) + (a.age ? ' · ' + Math.floor(a.age) + ' then' : '')}</div></div><div class="val">${fmt(a.value)}</div></div>`).join('') : '<div class="small">Nothing</div>'}</div>`).join('')}</div></div>`).join('')}` : ''}`;
+  <p class="small">Graded on values from the day of the trade, for trades since the site started saving daily values (${esc((RAW.history?.dates || [])[0] || 'today')}). Older trades are graded on today's values, with hindsight. Each grade compares what a side got against what it gave, adjusted so a 2-for-1 is judged fairly. A+ means a clear win, B is about even, F is a fleecing. Record is wins–losses(–evens).</p>
+  ${log.slice(0, 12).map(e => `<div class="card"><div class="trade-top"><span class="small">${e.when ? new Date(e.when).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : e.season}</span><span class="small" style="text-align:right"><b>${esc(e.verdict)}</b>${e.hindsight ? `<br>${esc(e.hindsight)}` : ''}</span></div>
+    <div class="sides">${e.sides.map(sd => `<div class="side"><h4 style="display:flex;justify-content:space-between"><span>${esc(sd.teamName)} got</span><span style="font-size:18px;color:${gradeCol(sd.grade)};letter-spacing:0">${sd.grade}${e.atTime && sd.gradeNow !== sd.grade ? `<span class="small" style="font-size:11px;color:var(--muted)"> now ${sd.gradeNow}</span>` : ''}</span></h4>${sd.got.length ? sd.got.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}</div><div class="meta">${a.kind === 'pick' ? 'Draft pick' : esc(a.pos) + (a.age ? ' · ' + Math.floor(a.age) + ' then' : '')}</div></div><div class="val">${e.atTime && a.then != null ? `${fmt(a.then)}<div class="small">now ${fmt(a.value)}</div>` : fmt(a.value)}</div></div>`).join('') : '<div class="small">Nothing</div>'}</div>`).join('')}</div></div>`).join('')}` : ''}`;
   $('#tab-league').insertAdjacentHTML('beforeend', profHtml);
   $('#tab-league').querySelectorAll('select').forEach(s => s.onchange = () => { prefs.strategy[s.dataset.r] = s.value; savePrefs(); rebuild(); });
 }

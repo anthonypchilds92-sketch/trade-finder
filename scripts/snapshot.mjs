@@ -20,6 +20,15 @@ if (idx === -1) {
   idx = hist.dates.length - 1;
   for (const id of Object.keys(hist.values)) hist.values[id].push(null);
 }
+// Picks: average value per season + round, saved as "pick:2027:1"
+const pickAgg = {};
+for (const r of rows) {
+  if (r.player?.position !== 'PICK') continue;
+  const y = (r.player.name.match(/\b(20\d\d)\b/) || [])[1];
+  const rd = (r.player.name.match(/(\d)(?:st|nd|rd|th)\b/i) || r.player.name.match(/Round\s*(\d)/i) || r.player.name.match(/Pick\s*(\d)\./i) || [])[1];
+  if (y && rd) (pickAgg[`pick:${y}:${rd}`] ??= []).push(r.value);
+}
+for (const [k, vs] of Object.entries(pickAgg)) { hist.values[k] ??= new Array(hist.dates.length).fill(null); hist.values[k][idx] = Math.round(vs.reduce((a, b) => a + b, 0) / vs.length); }
 for (const r of rows) {
   const id = r.player?.sleeperId;
   if (!id) continue;

@@ -53,6 +53,13 @@ const today = out.date;
 let idx = hist.dates.indexOf(today);
 if (idx === -1) { hist.dates.push(today); idx = hist.dates.length - 1; for (const k of Object.keys(hist.values)) hist.values[k].push(null); }
 for (const [id, x] of Object.entries(values)) { hist.values[id] ??= new Array(hist.dates.length).fill(null); hist.values[id][idx] = x.v; }
+const pickAgg = {};
+for (const pk of picks) {
+  const y = (pk.name.match(/\b(20\d\d)\b/) || [])[1];
+  const rd = (pk.name.match(/(\d)(?:st|nd|rd|th)\b/i) || [])[1];
+  if (y && rd) (pickAgg[`pick:${y}:${rd}`] ??= []).push(pk.value);
+}
+for (const [k, vs] of Object.entries(pickAgg)) { hist.values[k] ??= new Array(hist.dates.length).fill(null); hist.values[k][idx] = Math.round(vs.reduce((a, b) => a + b, 0) / vs.length); }
 const cutoff = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
 const from = hist.dates.findIndex(d => d >= cutoff);
 if (from > 0) { hist.dates = hist.dates.slice(from); for (const k of Object.keys(hist.values)) hist.values[k] = hist.values[k].slice(from); }
