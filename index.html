@@ -383,6 +383,7 @@ const ENGINE = (() => {
         wins: s.wins || 0, losses: s.losses || 0, ties: s.ties || 0,
         pf: (s.fpts || 0) + (s.fpts_decimal || 0) / 100,
         pa: (s.fpts_against || 0) + (s.fpts_against_decimal || 0) / 100,
+        ppts: s.ppts != null ? s.ppts + (s.ppts_decimal || 0) / 100 : null,
         playerIds: (r.players || []).map(String),
         taxiIds: (r.taxi || []).map(String),
         assets: [],
@@ -899,7 +900,9 @@ const ENGINE = (() => {
       const left = Math.max(0, regWeeks - r.weeks);
       r.projected = r.maxPF + r.recentAvg * left;
     }
-    rows.sort((a, b) => a.projected - b.projected);
+    // Draft order uses actual max PF so far (lowest picks first); projected order shown separately
+    rows.slice().sort((a, b) => a.projected - b.projected).forEach((r, i) => { r.projSlot = i + 1; });
+    rows.sort((a, b) => a.maxPF - b.maxPF);
     rows.forEach((r, i) => { r.slot = i + 1; });
     return { rows, played: Math.max(0, ...rows.map(r => r.weeks)), regWeeks };
   }
@@ -1848,11 +1851,11 @@ function renderLeague() {
   const pickOwner = rid => { const pk = MODEL.picks.get(`pick:${+RAW.league.season + 1}:1:${rid}`); return pk ? MODEL.teamById.get(pk.owner) : null; };
   const meRow = D?.rows.find(r => r.team === MODEL.me);
   const draftHtml = D && D.played ? `<h3 style="margin:4px 0 4px;font-size:16px">${+RAW.league.season + 1} draft order (max PF)</h3>
-  <p class="small">Max PF is each team's best possible lineup every week, with current taxi-squad players left out, over regular-season weeks 1–${reg}. After ${D.played} week${D.played === 1 ? '' : 's'}, the rest of the season is projected from each team's last 4 weeks. Lowest max PF picks first. This is worked out from Sleeper's weekly scoring, so it can differ slightly from your commissioner's figure.</p>
+  <p class="small">Max PF is each team's best possible lineup every week, with current taxi-squad players left out, over regular-season weeks 1–${reg}. Lowest max PF picks first; pick numbers are from the ${D.played} week${D.played === 1 ? '' : 's'} played so far. "Proj." is where each team would land if it keeps scoring at its last-4-week rate. Sleeper's own Max PF (which includes taxi players) is shown for comparison.</p>
   ${meRow ? (() => { const above = D.rows[meRow.slot]; const below = D.rows[meRow.slot - 2];
-      return `<div class="card"><b>You're projected at pick ${meRow.slot}</b> with ${meRow.maxPF.toFixed(1)} max PF so far (${meRow.recentAvg.toFixed(1)} a week lately).${below ? ` ${esc(below.team.name)} are ${(meRow.projected - below.projected).toFixed(1)} below you.` : ''}${above ? ` ${esc(above.team.name)} are ${(above.projected - meRow.projected).toFixed(1)} above you.` : ''}${pickOwner(MODEL.me.rosterId) && pickOwner(MODEL.me.rosterId) !== MODEL.me ? ` Your 1st belongs to <b>${esc(pickOwner(MODEL.me.rosterId).name)}</b>.` : ''}</div>`; })() : ''}
-  <div class="card scroll"><table><thead><tr><th class="n">Pick</th><th>Team</th><th class="n">Max PF</th><th class="n">Last 4 avg</th><th class="n">Projected</th><th>1st owned by</th></tr></thead><tbody>
-  ${D.rows.map(r => { const o = pickOwner(r.team.rosterId); return `<tr${r.team === MODEL.me ? ' style="background:var(--panel2)"' : ''}><td class="n"><b>${r.slot}</b></td><td>${esc(r.team.name)}</td><td class="n">${r.maxPF.toFixed(1)}</td><td class="n">${r.recentAvg.toFixed(1)}</td><td class="n">${r.projected.toFixed(0)}</td><td class="small">${o ? (o === r.team ? 'Own' : esc(o.name)) : '–'}</td></tr>`; }).join('')}
+      return `<div class="card"><b>You're at pick ${meRow.slot}</b> (projected ${meRow.projSlot}) with ${meRow.maxPF.toFixed(1)} max PF so far (${meRow.recentAvg.toFixed(1)} a week lately).${below ? ` ${esc(below.team.name)} are ${(meRow.maxPF - below.maxPF).toFixed(1)} below you.` : ''}${above ? ` ${esc(above.team.name)} are ${(above.maxPF - meRow.maxPF).toFixed(1)} above you.` : ''}${pickOwner(MODEL.me.rosterId) && pickOwner(MODEL.me.rosterId) !== MODEL.me ? ` Your 1st belongs to <b>${esc(pickOwner(MODEL.me.rosterId).name)}</b>.` : ''}</div>`; })() : ''}
+  <div class="card scroll"><table><thead><tr><th class="n">Pick</th><th>Team</th><th class="n">Max PF</th><th class="n">Sleeper</th><th class="n">Last 4</th><th class="n">Proj.</th><th>1st owned by</th></tr></thead><tbody>
+  ${D.rows.map(r => { const o = pickOwner(r.team.rosterId); return `<tr${r.team === MODEL.me ? ' style="background:var(--panel2)"' : ''}><td class="n"><b>${r.slot}</b></td><td>${esc(r.team.name)}</td><td class="n">${r.maxPF.toFixed(1)}</td><td class="n small">${r.team.ppts != null ? r.team.ppts.toFixed(1) : '–'}</td><td class="n">${r.recentAvg.toFixed(1)}</td><td class="n">${r.projSlot}</td><td class="small">${o ? (o === r.team ? 'Own' : esc(o.name)) : '–'}</td></tr>`; }).join('')}
   </tbody></table></div>` : '';
   $('#tab-league').innerHTML = draftHtml + `<p class="small">Strategies are guessed from lineup strength, record and points scored. Change any team's strategy and the trade search will treat them that way.</p>
   <div class="card scroll"><table><thead><tr><th>Team</th><th class="n">Rec</th><th class="n">Lineup</th><th class="n">Roster age</th><th>Strategy</th></tr></thead><tbody>
