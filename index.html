@@ -77,7 +77,7 @@
     </div>
     <nav id="tabs">
       <button data-tab="trades" class="on">Top trades</button>
-      <button data-tab="targets">Breakout targets</button>
+      <button data-tab="targets">Targets</button>
       <button data-tab="myteam">My team</button>
       <button data-tab="league">League</button>
       <button data-tab="settings">Settings</button>
@@ -303,9 +303,13 @@ const ENGINE = (() => {
         p.trendPct = trendPct;
         const peak = clamp(trendPct / 0.10);
         p.sell = 0.5 * decline + 0.25 * nowRatio + 0.25 * peak;
-        const roleIntact = sig.usage == null ? true : sig.usage >= 0.6;
+        const roleIntact = sig.usage == null ? true
+          : sig.usage >= 0.7 && (p.snapShare == null || p.snapShare >= 0.6);
         p.dip = trendPct <= -0.05 && p.value >= 1500 && roleIntact;
         if (trendPct <= -0.05) p.sell *= p.dip ? 0.35 : 0.7;
+        // Buy-low: a dip in a prime-age player whose role is intact. Assume ~60% of the drop comes back.
+        p.buyLow = p.dip && (p.age ?? 99) <= 28;
+        p.rebound = p.buyLow ? (p.value - p.trend * 0.6) * p.ageMult : null;
       }
     }
     for (const p of players.values()) if (!SKILL.includes(p.pos)) {
@@ -394,7 +398,9 @@ const ENGINE = (() => {
     }).sort((a, b) => (b.sell * b.value) - (a.sell * a.value)).slice(0, 12);
 
     const myStrat = STRAT_W[me.strategy];
-    const myAssetScore = a => a.future * (1 + 0.35 * a.breakout);
+    const myAssetScore = a => a.buyLow && prefs.buyLow !== false
+      ? Math.max(a.future, a.rebound) * (1 + 0.15 * (prefs.buyLowWeight ?? 1))
+      : a.future * (1 + 0.35 * a.breakout);
     const results = [];
 
     for (const t of model.teams) {
@@ -402,7 +408,7 @@ const ENGINE = (() => {
       const w = STRAT_W[t.strategy];
       const theirBefore = lineupValue(t.players, model.slots).total;
       // What I'd want from them: young / breakout / picks
-      const want = t.assets.filter(a => a.value >= 400 && (a.kind === 'pick' || a.ageMult >= 1 || a.breakout >= 0.45))
+      const want = t.assets.filter(a => a.value >= 400 && (a.kind === 'pick' || a.ageMult >= 1 || a.breakout >= 0.45 || (a.buyLow && prefs.buyLow !== false)))
         .sort((a, b) => myAssetScore(b) - myAssetScore(a)).slice(0, 14);
       const cap = maxPer >= 3 ? 8 : 99;
       const giveSets = combos(give.slice(0, cap), maxPer), getSets = combos(want.slice(0, cap + 2), maxPer);
@@ -468,6 +474,13 @@ const ENGINE = (() => {
     return why;
   }
   function assetReason(a) {
+    if (a.buyLow) {
+      const b = [`buy low: value down ${fmt(-a.trend)} (${Math.round(-a.trendPct * 100)}%) in 30 days`];
+      if (a.signals?.usage != null) b.push(`but his role is intact (${a.snapShare ? Math.round(a.snapShare * 100) + '% snaps, ' : ''}usage in the top ${Math.max(1, Math.round((1 - a.signals.usage) * 100))}% of ${a.pos}s)`);
+      else b.push('but nothing suggests he has lost his role');
+      b.push(`age ${Math.floor(a.age)}, so a rebound back toward ${fmt(a.value - a.trend * 0.6)} is realistic`);
+      return b.join(', ') + '.';
+    }
     if (a.kind === 'pick') return `a ${a.season} ${['', '1st', '2nd', '3rd', '4th'][a.round] || 'round ' + a.round}-round pick, the kind of asset rebuilders want.`;
     const bits = [];
     if (a.age) bits.push(`age ${Math.floor(a.age)}`);
@@ -589,7 +602,7 @@ function renderTrades() {
   if (!trades.length) { el.innerHTML = `<div class="card">No trades pass the filters right now. Try widening the fairness range or marking more players as "Shop" in My team.</div>`; return; }
   el.innerHTML = `<p class="small">Ranked by how much each deal helps your rebuild, with a check that the other side would want it too. Values are FantasyCalc dynasty values for your format.</p>` +
     trades.map((tr, i) => {
-      const side = (title, list) => `<div class="side"><h4>${title}</h4>${list.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}${a.breakout >= 0.55 && a.kind === 'player' ? '<span class="tag hot">breakout</span>' : ''}</div><div class="meta">${esc(assetMeta(a))}</div></div><div class="val">${fmt(a.value)}</div></div>`).join('')}</div>`;
+      const side = (title, list) => `<div class="side"><h4>${title}</h4>${list.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}${a.buyLow && tr.get.includes(a) ? '<span class="tag buy">buy low</span>' : a.breakout >= 0.55 && a.kind === 'player' ? '<span class="tag hot">breakout</span>' : ''}</div><div class="meta">${esc(assetMeta(a))}</div></div><div class="val">${fmt(a.value)}</div></div>`).join('')}</div>`;
       const d = Math.max(-0.3, Math.min(0.3, tr.diff));
       const left = 50 + (d / 0.3) * 50;
       const color = Math.abs(tr.diff) <= 0.06 ? 'var(--good)' : 'var(--warn)';
@@ -608,7 +621,17 @@ function renderTargets() {
     .sort((a, b) => b.breakout - a.breakout).slice(0, 40);
   const ownerName = id => MODEL.teamById.get(id)?.name || '';
   const s = MODEL.haveStats;
-  $('#tab-targets').innerHTML = `<p class="small">Players on other rosters with the strongest breakout signals: youth, ${s ? 'usage, production ahead of value, ' : ''}Sleeper trending adds and 30-day value momentum.</p>
+  const dips = [...MODEL.players.values()].filter(p => p.owner !== MODEL.me.rosterId && p.buyLow)
+    .sort((a, b) => (b.rebound - b.future) - (a.rebound - a.future) || a.trendPct - b.trendPct);
+  const dipHtml = `<h3 style="margin:14px 0 4px;font-size:16px">Buy-low dips</h3>
+  <p class="small">Players aged 28 or under whose value has dropped at least 5% in 30 days while their snaps and targets are still strong. The drop is likely down to their situation (QB play, the offence, a short slump), not a lost role.</p>
+  ${dips.length ? `<div class="card scroll"><table><thead><tr><th>Player</th><th>Owner</th><th class="n">Value</th><th class="n">30-day</th>${s ? '<th class="n">Snaps</th>' : ''}</tr></thead><tbody>
+  ${dips.map(p => `<tr><td><b>${esc(p.name)}</b><span class="tag buy">buy low</span><div class="small">${esc(assetMeta(p))}${p.ppgRank && p.valRank ? ` · scoring ${p.pos}${p.ppgRank}` : ''}</div></td>
+    <td class="small">${esc(ownerName(p.owner))}<br>${stratPill(MODEL.teamById.get(p.owner))}</td>
+    <td class="n">${fmt(p.value)}</td><td class="n" style="color:var(--bad)">${fmt(p.trend)}<div class="small">${Math.round(p.trendPct * 100)}%</div></td>
+    ${s ? `<td class="n">${p.snapShare ? Math.round(p.snapShare * 100) + '%' : '–'}</td>` : ''}</tr>`).join('')}
+  </tbody></table></div>` : `<div class="card small">No role-intact dips right now. Every prime-age player who has lost value has also lost snaps or targets.</div>`}`;
+  $('#tab-targets').innerHTML = dipHtml + `<h3 style="margin:18px 0 4px;font-size:16px">Breakout targets</h3><p class="small">Players on other rosters with the strongest breakout signals: youth, ${s ? 'usage, production ahead of value, ' : ''}Sleeper trending adds and 30-day value momentum.</p>
   <div class="card scroll"><table><thead><tr><th>Player</th><th>Owner</th><th class="n">Value</th>${s ? '<th class="n">PPG</th>' : ''}<th class="n">Adds</th><th>Score</th></tr></thead><tbody>
   ${list.map(p => `<tr><td><b>${esc(p.name)}</b><div class="small">${esc(assetMeta(p))}${p.ppgRank && p.valRank ? ` · scoring ${p.pos}${p.ppgRank}, valued ${p.pos}${p.valRank}` : ''}</div></td>
     <td class="small">${esc(ownerName(p.owner))}<br>${stratPill(MODEL.teamById.get(p.owner))}</td><td class="n">${fmt(p.value)}${p.trend ? `<div class="small" style="color:${p.trend > 0 ? 'var(--good)' : 'var(--bad)'}">${p.trend > 0 ? '+' : ''}${fmt(p.trend)}</div>` : ''}</td>
@@ -663,6 +686,7 @@ function renderSettings() {
       <select id="s-fair">${[0.06, 0.1, 0.12, 0.15, 0.2].map(v => `<option value="${v}" ${prefs.fairness == v ? 'selected' : ''}>±${Math.round(v * 100)}%</option>`).join('')}</select></label>
     <label class="set"><span>Max assets per side</span>
       <select id="s-max">${[1, 2, 3].map(v => `<option ${prefs.maxAssets == v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+    <label class="set"><span>Target buy-low dips<div class="small">Prime-age stars whose value has dropped while their role hasn't</div></span><input type="checkbox" id="s-buylow" ${prefs.buyLow !== false ? 'checked' : ''}></label>
     <label class="set"><span>Never trade away my picks</span><input type="checkbox" id="s-picks" ${prefs.protectPicks ? 'checked' : ''}></label>
     <label class="set"><span>Number of trades to show</span>
       <select id="s-n">${[10, 20, 30].map(v => `<option ${prefs.maxResults == v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
@@ -671,6 +695,7 @@ function renderSettings() {
   </div>`;
   $('#s-fair').onchange = e => { prefs.fairness = +e.target.value; savePrefs(); rebuild(); };
   $('#s-max').onchange = e => { prefs.maxAssets = +e.target.value; savePrefs(); rebuild(); };
+  $('#s-buylow').onchange = e => { prefs.buyLow = e.target.checked; savePrefs(); rebuild(); };
   $('#s-picks').onchange = e => { prefs.protectPicks = e.target.checked; savePrefs(); rebuild(); };
   $('#s-n').onchange = e => { prefs.maxResults = +e.target.value; savePrefs(); rebuild(); };
   $('#s-reset').onclick = () => { prefs.strategy = {}; prefs.marks = {}; savePrefs(); rebuild(); };
