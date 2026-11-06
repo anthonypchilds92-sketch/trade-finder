@@ -384,6 +384,7 @@ const ENGINE = (() => {
         pf: (s.fpts || 0) + (s.fpts_decimal || 0) / 100,
         pa: (s.fpts_against || 0) + (s.fpts_against_decimal || 0) / 100,
         playerIds: (r.players || []).map(String),
+        taxiIds: (r.taxi || []).map(String),
         assets: [],
       };
     });
@@ -402,7 +403,8 @@ const ENGINE = (() => {
         name: f?.player.name || sp.full_name || (sp.first_name ? `${sp.first_name} ${sp.last_name}` : `Player ${id}`),
         pos, team: f?.player.maybeTeam || sp.team || 'FA',
         age: age != null ? +age : null,
-        yoe: f?.player.maybeYoe ?? sp.years_exp ?? null,
+        yoe: sp.years_exp ?? f?.player.maybeYoe ?? null,
+        onTaxi: (t.taxiIds || []).includes(id),
         value, now, trend: f?.trend30Day ?? 0,
         injury: sp.injury_status || (sp.status === 'Injured Reserve' ? 'IR' : null),
         injuryBody: sp.injury_body_part || null,
@@ -412,6 +414,10 @@ const ENGINE = (() => {
         adds: trendMap.get(id) || 0,
       });
     }
+
+    // ---- Taxi eligibility next season: this season's rookies will be second-years (taxi_years = 2) ----
+    const taxiYears = league.settings?.taxi_years ?? 2;
+    for (const p of players.values()) p.taxiNext = SKILL.includes(p.pos) && p.yoe != null && p.yoe + 1 < taxiYears;
 
     // ---- Handcuffs: link each NFL team's RB2 to its RB1 ----
     // Uses Sleeper depth charts (all NFL RBs, rostered or not); falls back to value order among rostered RBs.
@@ -684,11 +690,15 @@ const ENGINE = (() => {
   // ---- Shared trade evaluator ----
   function makeCtx(model, prefs) {
     const me = model.me;
+    // Want at least `taxiGoal` good taxi-eligible players for next season: boost rookies until then
+    const goal = prefs.taxiGoal ?? 4;
+    const haveTaxi = me.players.filter(p => p.taxiNext && p.value >= 800).length;
+    const taxiBoost = a => a.taxiNext && a.owner !== me.rosterId && haveTaxi < goal && a.value >= 500 ? 1.12 : 1;
     const myAssetScore = a => {
-      if (a.injStash && prefs.injuryStash !== false) return Math.max(a.future, a.injRebound) * 1.1;
+      if (a.injStash && prefs.injuryStash !== false) return Math.max(a.future, a.injRebound) * 1.1 * taxiBoost(a);
       if (a.buyLow && prefs.buyLow !== false) return Math.max(a.future, a.rebound) * (1.15 * (0.85 + 0.3 * a.dipFatigue));
       // Same strategy lens on what you receive as on what you give (a rebuild discounts veterans either way)
-      return stratFuture(a, me.strategy) * (1 + 0.35 * a.breakout);
+      return stratFuture(a, me.strategy) * (1 + 0.35 * a.breakout) * taxiBoost(a);
     };
     // A manager whose player dipped recently still anchors to the old price; after a long dip they let go.
     const anchored = a => a.buyLow ? 1 + a.dropPct * (1 - a.dipFatigue) : 1;
@@ -862,6 +872,36 @@ const ENGINE = (() => {
     for (const pk of K.picks || []) rows.push({ player: { name: pk.name, position: 'PICK' }, value: pk.value });
     const history = src === 'ktc' && RAW.historyKtc?.dates?.length ? RAW.historyKtc : RAW.history;
     return { ...RAW, fc: rows, history, pickTeams: src === 'ktc' ? 12 : undefined, valueLabel: src === 'blend' ? 'KTC + FantasyCalc blend' : 'KTC' };
+  }
+
+  // ---- Draft order: max PF (best possible lineup each week) excluding taxi players, regular season only ----
+  // matchups: { [week]: [{ roster_id, players: [ids], players_points: {id: pts} }] }
+  function draftOrder(model, matchups, regWeeks) {
+    const sp = model.sleeperPlayers || {};
+    const posOf = id => model.players.get(id)?.pos || sp[id]?.position || '?';
+    const rows = model.teams.map(t => ({ team: t, maxPF: 0, weeks: 0, byWeek: [] }));
+    const byRoster = new Map(rows.map(r => [r.team.rosterId, r]));
+    const taxi = new Map(model.teams.map(t => [t.rosterId, new Set(t.taxiIds || [])]));
+    for (const w of Object.keys(matchups || {}).map(Number).sort((a, b) => a - b)) {
+      if (w > regWeeks) continue;
+      for (const m of matchups[w] || []) {
+        const row = byRoster.get(m.roster_id); if (!row) continue;
+        const pts = m.players_points || {};
+        const pool = (m.players || []).map(String).filter(id => !taxi.get(m.roster_id)?.has(id))
+          .map(id => ({ id, pos: posOf(id), pts: pts[id] || 0 }));
+        const best = lineupValue(pool, model.slots, 'pts').total;
+        row.maxPF += best; row.weeks++; row.byWeek.push(best);
+      }
+    }
+    for (const r of rows) {
+      const recent = r.byWeek.slice(-4);
+      r.recentAvg = recent.length ? recent.reduce((a, b) => a + b, 0) / recent.length : 0;
+      const left = Math.max(0, regWeeks - r.weeks);
+      r.projected = r.maxPF + r.recentAvg * left;
+    }
+    rows.sort((a, b) => a.projected - b.projected);
+    rows.forEach((r, i) => { r.slot = i + 1; });
+    return { rows, played: Math.max(0, ...rows.map(r => r.weeks)), regWeeks };
   }
 
   // ---- Free agents worth picking up ----
@@ -1239,6 +1279,7 @@ const ENGINE = (() => {
     if (a.expert && a.expert.up > a.expert.down) bits.push(`tipped to rise in ${a.expert.sources.length} expert source${a.expert.sources.length === 1 ? '' : 's'}`);
     if (a.trend > 0 && a.trend / Math.max(1, a.value) > 0.05) bits.push(`value up ${fmt(a.trend)} in 30 days`);
     if ((a.yoe ?? 9) <= 1) bits.push(a.yoe === 0 ? 'rookie' : '2nd-year player');
+    if (a.taxiNext && a.owner !== undefined) bits.push('taxi-eligible next season');
     if (bits.length <= 1) bits.push('young enough to hold or grow his value');
     return bits.join(', ') + '.';
   }
@@ -1254,7 +1295,7 @@ const ENGINE = (() => {
   }
   const fmt = x => Math.round(x).toLocaleString('en-GB');
 
-  return { buildModel, applyValues, ktcCompare, generateTrades, offersFor, asksFor, weeklyNeeds, evaluateIncoming, freeAgents, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
+  return { buildModel, applyValues, ktcCompare, draftOrder, generateTrades, offersFor, asksFor, weeklyNeeds, evaluateIncoming, freeAgents, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
 })();
 if (typeof module !== 'undefined') module.exports = ENGINE;
 /*ENGINE-END*/
@@ -1338,6 +1379,19 @@ async function loadTradeHistory(league, currentWeek) {
   return out;
 }
 let RAW_ROSTERS = [];
+// Weekly scoring for every roster (finished weeks are cached; they don't change)
+async function loadMatchups(league) {
+  const last = league.settings?.last_scored_leg || 0;
+  const reg = (league.settings?.playoff_week_start || 15) - 1;
+  const weeks = Array.from({ length: Math.min(last, reg) }, (_, i) => i + 1);
+  const out = {};
+  await Promise.all(weeks.map(async w => {
+    const done = w < last;
+    const load = () => getJSON(`${SLEEPER}/league/${LEAGUE_ID}/matchups/${w}`).then(ms => ms.map(m => ({ roster_id: m.roster_id, players: m.players, players_points: m.players_points })));
+    out[w] = await (done ? cached(`mu:${league.season}:${w}`, 365 * 86400000, load) : load()).catch(() => null);
+  }));
+  return out;
+}
 
 async function load(force) {
   status('Fetching Sleeper and FantasyCalc…');
@@ -1358,7 +1412,7 @@ async function load(force) {
     status('Loading player details, season stats and trade history…');
     RAW_ROSTERS = rosters.map(r => ({ roster_id: r.roster_id, owner_id: r.owner_id }));
     const season = nfl?.season || league.season;
-    const [sleeperPlayers, stats, history, weekInfo, ktc, experts, historyKtc, tradeHistory] = await Promise.all([
+    const [sleeperPlayers, stats, history, weekInfo, ktc, experts, historyKtc, tradeHistory, matchups] = await Promise.all([
       soft(force ? getJSON(`${SLEEPER}/players/nfl`) : cached('players', 86400000, () => getJSON(`${SLEEPER}/players/nfl`))),
       soft(getJSON(`${SLEEPER}/stats/nfl/regular/${season}`).catch(() => getJSON(`https://api.sleeper.com/stats/nfl/${season}?season_type=regular`))),
       soft(fetch('data/history.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
@@ -1367,8 +1421,9 @@ async function load(force) {
       soft(fetch('data/experts.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(fetch('data/history-ktc.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(loadTradeHistory(league, nfl?.week)),
+      soft(loadMatchups(league)),
     ]);
-    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc, experts };
+    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc, experts, matchups };
     rebuild();
     const missing = [!tradeHistory && 'trade history', !stats && 'season stats', !trending && 'trending adds', !sleeperPlayers && 'player details'].filter(Boolean);
     status(`Updated ${new Date().toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` + (missing.length ? ` · couldn't load ${missing.join(', ')}, so those signals are skipped` : ''));
@@ -1567,7 +1622,16 @@ function renderTargets() {
     <td class="n">${fmt(p.value)}<div class="small" style="color:var(--good)">→ ${fmt(p.injRebound / p.ageMult)}</div></td>
     <td class="small">${esc(p.injury)}${p.injuryBody ? ' · ' + esc(p.injuryBody) : ''}<br>${esc(p.injSeverity)} · ${Math.round(p.injRecovery * 100)}% recovery</td></tr>`).join('')}
   </tbody></table><p class="small">"→" is roughly what he'd be worth once healthy and producing again.</p></div>` : `<div class="card small">No young players on other teams are currently out with an injury they're expected to recover from.</div>`}`;
-  $('#tab-targets').innerHTML = dipHtml + injHtml + `<h3 style="margin:18px 0 4px;font-size:16px">Breakout targets</h3><p class="small">Players on other rosters with the strongest breakout signals: youth, ${s ? 'usage, production ahead of value, ' : ''}Sleeper trending adds and 30-day value momentum.</p>
+  const mineTaxi = MODEL.me.players.filter(p => p.taxiNext && p.value >= 300).sort((a, b) => b.value - a.value);
+  const taxiT = [...MODEL.players.values()].filter(p => p.owner !== MODEL.me.rosterId && p.taxiNext && p.value >= 500)
+    .sort((a, b) => (b.value * (1 + b.breakout)) - (a.value * (1 + a.breakout))).slice(0, 15);
+  const taxiHtml = `<h3 style="margin:18px 0 4px;font-size:16px">Taxi stashes for next season</h3>
+  <p class="small">This season's rookies, who will still be taxi-eligible next year. They don't count towards max PF while on the taxi squad, which suits a 2027 tank. You have ${mineTaxi.length}: ${mineTaxi.map(p => esc(p.name)).join(', ') || 'none'}. Until you have ${prefs.taxiGoal ?? 4} worth 800 or more, trade suggestions favour these players slightly. Tap a player to see offers.</p>
+  ${taxiT.length ? `<div class="card scroll"><table><thead><tr><th>Player</th><th>Owner</th><th class="n">Value</th><th>Score</th></tr></thead><tbody>
+  ${taxiT.map(p => `<tr class="tap" data-id="${esc(p.id)}"><td><b>${esc(p.name)}</b><span class="tag buy">taxi '${String(+RAW.league.season + 1).slice(2)}</span><div class="small">${esc(assetMeta(p))}${p.ppg != null ? ` · ${p.ppg.toFixed(1)} ppg` : ''}</div></td>
+    <td class="small">${esc(ownerName(p.owner))}<br>${stratPill(MODEL.teamById.get(p.owner))}</td><td class="n">${fmt(p.value)}${p.trend ? `<div class="small" style="color:${p.trend > 0 ? 'var(--good)' : 'var(--bad)'}">${p.trend > 0 ? '+' : ''}${fmt(p.trend)}</div>` : ''}</td>
+    <td><div class="bar"><span style="width:${Math.round(p.breakout * 100)}%"></span></div></td></tr>`).join('')}</tbody></table></div>` : '<div class="card small">No rookies on other teams worth 500 or more.</div>'}`;
+  $('#tab-targets').innerHTML = dipHtml + injHtml + taxiHtml + `<h3 style="margin:18px 0 4px;font-size:16px">Breakout targets</h3><p class="small">Players on other rosters with the strongest breakout signals: youth, ${s ? 'usage, production ahead of value, ' : ''}Sleeper trending adds and 30-day value momentum.</p>
   <div class="card scroll"><table><thead><tr><th>Player</th><th>Owner</th><th class="n">Value</th>${s ? '<th class="n">PPG</th>' : ''}<th class="n">Adds</th><th>Score</th></tr></thead><tbody>
   ${list.map(p => `<tr class="tap" data-id="${esc(p.id)}"><td><b>${esc(p.name)}</b><div class="small">${esc(assetMeta(p))}${p.ppgRank && p.valRank ? ` · scoring ${p.pos}${p.ppgRank}, valued ${p.pos}${p.valRank}` : ''}</div></td>
     <td class="small">${esc(ownerName(p.owner))}<br>${stratPill(MODEL.teamById.get(p.owner))}</td><td class="n">${fmt(p.value)}${p.trend ? `<div class="small" style="color:${p.trend > 0 ? 'var(--good)' : 'var(--bad)'}">${p.trend > 0 ? '+' : ''}${fmt(p.trend)}</div>` : ''}</td>
@@ -1754,6 +1818,7 @@ function renderMyTeam() {
     else if (a.sell >= 0.45) t += '<span class="tag sell">sell high</span>';
     if (a.breakout >= 0.55) t += '<span class="tag buy">core</span>';
     if (starters.has(a.id)) t += '<span class="tag">starter</span>';
+    if (a.taxiNext) t += `<span class="tag buy">taxi '${String(+RAW.league.season + 1).slice(2)}</span>`;
     if (a.cuffOf) {
       const owner = MODEL.players.get(a.cuffOf)?.owner;
       const ot = owner != null ? MODEL.teamById.get(owner) : null;
@@ -1778,7 +1843,18 @@ function renderMyTeam() {
 
 function renderLeague() {
   const teams = MODEL.teams.slice().sort((a, b) => a.contendRank - b.contendRank);
-  $('#tab-league').innerHTML = `<p class="small">Strategies are guessed from lineup strength, record and points scored. Change any team's strategy and the trade search will treat them that way.</p>
+  const reg = (RAW.league.settings?.playoff_week_start || 15) - 1;
+  const D = RAW.matchups ? ENGINE.draftOrder(MODEL, RAW.matchups, reg) : null;
+  const pickOwner = rid => { const pk = MODEL.picks.get(`pick:${+RAW.league.season + 1}:1:${rid}`); return pk ? MODEL.teamById.get(pk.owner) : null; };
+  const meRow = D?.rows.find(r => r.team === MODEL.me);
+  const draftHtml = D && D.played ? `<h3 style="margin:4px 0 4px;font-size:16px">${+RAW.league.season + 1} draft order (max PF)</h3>
+  <p class="small">Max PF is each team's best possible lineup every week, with current taxi-squad players left out, over regular-season weeks 1–${reg}. After ${D.played} week${D.played === 1 ? '' : 's'}, the rest of the season is projected from each team's last 4 weeks. Lowest max PF picks first. This is worked out from Sleeper's weekly scoring, so it can differ slightly from your commissioner's figure.</p>
+  ${meRow ? (() => { const above = D.rows[meRow.slot]; const below = D.rows[meRow.slot - 2];
+      return `<div class="card"><b>You're projected at pick ${meRow.slot}</b> with ${meRow.maxPF.toFixed(1)} max PF so far (${meRow.recentAvg.toFixed(1)} a week lately).${below ? ` ${esc(below.team.name)} are ${(meRow.projected - below.projected).toFixed(1)} below you.` : ''}${above ? ` ${esc(above.team.name)} are ${(above.projected - meRow.projected).toFixed(1)} above you.` : ''}${pickOwner(MODEL.me.rosterId) && pickOwner(MODEL.me.rosterId) !== MODEL.me ? ` Your 1st belongs to <b>${esc(pickOwner(MODEL.me.rosterId).name)}</b>.` : ''}</div>`; })() : ''}
+  <div class="card scroll"><table><thead><tr><th class="n">Pick</th><th>Team</th><th class="n">Max PF</th><th class="n">Last 4 avg</th><th class="n">Projected</th><th>1st owned by</th></tr></thead><tbody>
+  ${D.rows.map(r => { const o = pickOwner(r.team.rosterId); return `<tr${r.team === MODEL.me ? ' style="background:var(--panel2)"' : ''}><td class="n"><b>${r.slot}</b></td><td>${esc(r.team.name)}</td><td class="n">${r.maxPF.toFixed(1)}</td><td class="n">${r.recentAvg.toFixed(1)}</td><td class="n">${r.projected.toFixed(0)}</td><td class="small">${o ? (o === r.team ? 'Own' : esc(o.name)) : '–'}</td></tr>`; }).join('')}
+  </tbody></table></div>` : '';
+  $('#tab-league').innerHTML = draftHtml + `<p class="small">Strategies are guessed from lineup strength, record and points scored. Change any team's strategy and the trade search will treat them that way.</p>
   <div class="card scroll"><table><thead><tr><th>Team</th><th class="n">Rec</th><th class="n">Lineup</th><th class="n">Roster age</th><th>Strategy</th></tr></thead><tbody>
   ${teams.map(t => `<tr><td><b>${esc(t.name)}</b>${t === MODEL.me ? ' <span class="tag buy">you</span>' : ''}<div class="small">${esc(t.username)} · ${fmt(t.pf)} PF</div></td>
     <td class="n">${t.wins}–${t.losses}</td><td class="n">${fmt(t.lineupNow)}</td><td class="n">${t.avgAge ? t.avgAge.toFixed(1) : '–'}</td>
