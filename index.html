@@ -734,7 +734,8 @@ const ENGINE = (() => {
 
   // ---- Evaluate an offer someone sent you ----
   // giveIds: your assets they asked for; getIds: their assets they offered
-  function evaluateIncoming(model, prefs, rosterId, giveIds, getIds) {
+  function evaluateIncoming(model, prefs, rosterId, giveIds, getIds, mode = 'received') {
+    const proposing = mode === 'propose';
     const me = model.me, t = model.teamById.get(+rosterId);
     const G = giveIds.map(id => me.assets.find(a => a.id === id)).filter(Boolean);
     const R = getIds.map(id => t.assets.find(a => a.id === id)).filter(Boolean);
@@ -764,11 +765,18 @@ const ENGINE = (() => {
     }
     for (const a of G) if (a.kind === 'player' && a.sell >= 0.45 && !a.dip) goods.push(`Good time to sell ${a.name}: near his peak value.`);
     // They sent it, so they want your players: you can hold out for a little more than market
-    const premium = 0.05;
+    const premium = proposing ? 0 : 0.05;
     const adjDiff = r.diff - premium;
     const protectedHit = G.some(a => mark[a.id] === 'protect');
-    let verdict, tone;
-    if (r.myU >= 0.3 && adjDiff >= -0.03 && !protectedHit) { verdict = 'Accept'; tone = 'good'; }
+    let verdict, tone, likely = null;
+    if (proposing) {
+      likely = r.partnerU >= 0.4 ? 'Likely' : r.partnerU >= 0.1 ? 'Possible' : r.partnerU >= -0.3 ? 'Unlikely' : 'Very unlikely';
+      if (r.myU < 0) { verdict = 'Not worth it for you'; tone = 'bad'; }
+      else if (r.partnerU < 0.1) { verdict = 'Unlikely to be accepted'; tone = 'warn'; }
+      else if (r.myU >= 0.2) { verdict = 'Good offer to send'; tone = 'good'; }
+      else { verdict = 'Fair, small gain for you'; tone = 'warn'; }
+      if (r.partnerU >= 1.2 && r.myU >= 0) flags.push('They gain a lot from this. You could probably ask for more.');
+    } else if (r.myU >= 0.3 && adjDiff >= -0.03 && !protectedHit) { verdict = 'Accept'; tone = 'good'; }
     else if (r.myU >= -0.25 && adjDiff >= -0.15) { verdict = 'Counter'; tone = 'warn'; }
     else { verdict = 'Decline'; tone = 'bad'; }
     // Counter-offers
@@ -776,6 +784,22 @@ const ENGINE = (() => {
     const want = t.assets.filter(a => !R.includes(a) && a.value >= 150 && (a.kind === 'pick' || a.ageMult >= 1 || a.breakout >= 0.45 || a.buyLow || a.injStash))
       .sort((a, b) => a.value - b.value);
     const target = packageValue(G) * (1 + premium);
+    if (proposing && r.partnerU < 0.1) {
+      // (d) add the smallest sweetener from your tradeable players/picks that gets them interested
+      const pool = myGivePool(model, prefs, { forOffer: true }).filter(a => !G.includes(a)).sort((a, b) => a.value - b.value);
+      for (const x of pool) {
+        const c = evaluate(model, ctx, t, G.concat([x]), R, { noChecks: true });
+        if (c.partnerU >= 0.15 && c.myU >= 0) { counters.push({ kind: 'Sweeten it', note: `Add ${x.name} to your side.`, give: G.concat([x]), get: R, r: c }); break; }
+      }
+      // (e) ask for less: drop the piece of theirs you value least
+      if (R.length > 1) {
+        const least = R.slice().sort((a, b) => ctx.myAssetScore(a) - ctx.myAssetScore(b))[0];
+        const R2 = R.filter(a => a !== least);
+        const c = evaluate(model, ctx, t, G, R2, { noChecks: true });
+        if (c.partnerU > r.partnerU && c.myU >= 0) counters.push({ kind: 'Ask for less', note: `Drop ${least.name} from your ask.`, give: G, get: R2, r: c });
+      }
+      return { r, verdict, tone, likely, flags, goods, counters, premium, team: t, G, R, proposing };
+    }
     // (a) ask for one more piece: the smallest that gets you to fair-plus-premium
     for (const x of want) {
       const R2 = R.concat([x]);
@@ -803,7 +827,7 @@ const ENGINE = (() => {
         if (c.myU > r.myU && c.partnerU > -0.3) { counters.push({ kind: 'Give less', note: `Offer the same deal without ${a.name}.`, give: G2, get: R, r: c }); break; }
       }
     }
-    return { r, verdict, tone, flags, goods, counters, premium, team: t, G, R };
+    return { r, verdict, tone, likely, flags, goods, counters, premium, team: t, G, R, proposing };
   }
 
   // ---- This week: who is short because of byes or injuries, and can I sell them a fix? ----
@@ -1204,20 +1228,23 @@ function renderWeek() {
   el.querySelectorAll('tr.tap').forEach(tr => tr.onclick = () => { document.querySelector('nav button[data-tab="targets"]').click(); const row = document.querySelector(`#tab-targets tr.tap[data-id="${tr.dataset.id}"]`); if (row) { row.scrollIntoView({ block: 'center' }); toggleOffers(row); } });
 }
 
-let EVAL = { team: '', give: new Set(), get: new Set() };
+let EVAL = { team: '', give: new Set(), get: new Set(), mode: 'received' };
 function renderEvaluate() {
   const el = $('#tab-evaluate');
   const others = MODEL.teams.filter(t => t !== MODEL.me).sort((a, b) => a.name.localeCompare(b.name));
   const t = EVAL.team ? MODEL.teamById.get(+EVAL.team) : null;
   const chips = (assets, set, side) => assets.slice().sort((a, b) => b.value - a.value).filter(a => a.value >= 50 || set.has(a.id)).map(a =>
     `<button class="chip ${set.has(a.id) ? 'on' : ''}" data-side="${side}" data-id="${esc(a.id)}">${esc(a.name)} <span class="small">${a.kind === 'pick' ? '' : esc(a.pos) + ' · '}${fmt(a.value)}</span></button>`).join('');
-  el.innerHTML = `<p class="small">Got an offer? Pick the team, tick what they want from you and what they're offering, and you'll get a verdict and a counter-offer.</p>
-    <div class="card"><div class="row"><select id="ev-team"><option value="">Who sent it?</option>${others.map(x => `<option value="${x.rosterId}" ${String(x.rosterId) === String(EVAL.team) ? 'selected' : ''}>${esc(x.name)} (${label(x.strategy)})</option>`).join('')}</select>
+  const prop = EVAL.mode === 'propose';
+  el.innerHTML = `<div class="seg" id="ev-mode" style="margin:4px 0 8px"><button data-mode="received" class="${prop ? '' : 'on'}" style="padding:6px 12px;font-size:13px">They sent me this</button><button data-mode="propose" class="${prop ? 'on' : ''}" style="padding:6px 12px;font-size:13px">I'm proposing this</button></div>
+    <p class="small">${prop ? "Build your own offer: pick the team, tick what you'd give and what you'd ask for. You'll see whether it's good for you and how likely they are to accept." : "Got an offer? Pick the team, tick what they want from you and what they're offering, and you'll get a verdict and a counter-offer."}</p>
+    <div class="card"><div class="row"><select id="ev-team"><option value="">${prop ? 'Which team?' : 'Who sent it?'}</option>${others.map(x => `<option value="${x.rosterId}" ${String(x.rosterId) === String(EVAL.team) ? 'selected' : ''}>${esc(x.name)} (${label(x.strategy)})</option>`).join('')}</select>
       ${EVAL.give.size || EVAL.get.size ? '<button class="btn ghost" id="ev-clear" style="padding:4px 10px">Clear</button>' : ''}</div>
-    ${t ? `<h4 class="small" style="margin:12px 0 6px;text-transform:uppercase;letter-spacing:.06em">They want from you</h4><div class="chips">${chips(MODEL.me.assets, EVAL.give, 'give')}</div>
-      <h4 class="small" style="margin:14px 0 6px;text-transform:uppercase;letter-spacing:.06em">They're offering</h4><div class="chips">${chips(t.assets, EVAL.get, 'get')}</div>` : ''}</div>
+    ${t ? `<h4 class="small" style="margin:12px 0 6px;text-transform:uppercase;letter-spacing:.06em">${prop ? 'You give' : 'They want from you'}</h4><div class="chips">${chips(MODEL.me.assets, EVAL.give, 'give')}</div>
+      <h4 class="small" style="margin:14px 0 6px;text-transform:uppercase;letter-spacing:.06em">${prop ? 'You ask for' : "They're offering"}</h4><div class="chips">${chips(t.assets, EVAL.get, 'get')}</div>` : ''}</div>
     <div id="ev-out"></div>`;
-  $('#ev-team').onchange = e => { EVAL = { team: e.target.value, give: new Set(), get: new Set() }; renderEvaluate(); };
+  $('#ev-team').onchange = e => { EVAL = { team: e.target.value, give: new Set(), get: new Set(), mode: EVAL.mode }; renderEvaluate(); };
+  el.querySelectorAll('#ev-mode button').forEach(b => b.onclick = () => { EVAL.mode = b.dataset.mode; renderEvaluate(); });
   if ($('#ev-clear')) $('#ev-clear').onclick = () => { EVAL.give.clear(); EVAL.get.clear(); renderEvaluate(); };
   el.querySelectorAll('button.chip').forEach(b => b.onclick = () => {
     const set = b.dataset.side === 'give' ? EVAL.give : EVAL.get;
@@ -1225,13 +1252,16 @@ function renderEvaluate() {
     const y = window.scrollY; renderEvaluate(); window.scrollTo(0, y);
   });
   if (!t || !EVAL.give.size || !EVAL.get.size) return;
-  const res = ENGINE.evaluateIncoming(MODEL, P(), t.rosterId, [...EVAL.give], [...EVAL.get]);
+  const res = ENGINE.evaluateIncoming(MODEL, P(), t.rosterId, [...EVAL.give], [...EVAL.get], EVAL.mode);
   if (!res) return;
   const { r } = res;
   const col = { good: 'var(--good)', warn: 'var(--warn)', bad: 'var(--bad)' }[res.tone];
   const pct = Math.round(r.diff * 100);
   const why = [
-    `Market: you give ${fmt(r.gv)}, you get ${fmt(r.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${-pct}% their way`}). They came to you, so aim for at least +${Math.round(res.premium * 100)}%.`,
+    `Market: you give ${fmt(r.gv)}, you get ${fmt(r.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${-pct}% their way`}).${res.proposing ? '' : ` They came to you, so aim for at least +${Math.round(res.premium * 100)}%.`}`,
+    ...(res.proposing ? [`Chance they accept: ${res.likely}. ${r.theirNow > 150 ? `Their lineup gets stronger by about ${fmt(r.theirNow)}. ` : r.theirNow < -150 ? `It weakens their lineup by about ${fmt(-r.theirNow)}. ` : ''}${r.theirFut > 0 ? 'They gain long-term value.' : 'They lose long-term value.'}`] : []),
+    ...(r.tendency?.length ? [`Their trade history: ${r.tendency.join('; ')}.`] : []),
+    ...(r.learned?.length ? [`From your past offers: ${r.learned.join('; ')}.`] : []),
     r.myFut > 0 ? `Long-term value for your rebuild: up about ${fmt(r.myFut)}.` : `Long-term value for your rebuild: down about ${fmt(-r.myFut)}.`,
   ];
   const counterCard = c => { const pc = Math.round(c.r.diff * 100); return `<div class="card" style="margin:8px 0"><div class="small" style="margin-bottom:6px"><b>${esc(c.kind)}</b> · ${esc(c.note)}</div>
@@ -1239,10 +1269,10 @@ function renderEvaluate() {
     <div class="small" style="margin-top:6px">Market ${pc === 0 ? 'even' : pc > 0 ? `+${pc}% your way` : `${-pc}% their way`}.</div>${offerButton(Object.assign(c.r, { partner: res.team }))}</div>`; };
   $('#ev-out').innerHTML = `<div class="card"><div class="trade-top"><span style="font-size:20px;font-weight:700;color:${col}">${res.verdict}</span><span class="pill">${esc(res.team.name)} · ${label(res.team.strategy)}</span></div>
     <ul class="why">${why.map(w => `<li>${esc(w)}</li>`).join('')}${res.goods.map(w => `<li style="color:var(--good)">${esc(w)}</li>`).join('')}${res.flags.map(w => `<li style="color:var(--warn)">${esc(w)}</li>`).join('')}</ul>
-    <div class="row" style="margin-top:10px"><button class="btn ghost" id="ev-log">Log interest in my players</button></div></div>
-    ${res.counters.length ? `<h3 style="margin:14px 0 4px;font-size:16px">${res.verdict === 'Accept' ? 'You could still try' : 'Counter-offers'}</h3>${res.counters.map(counterCard).join('')}` : res.verdict === 'Decline' ? '<div class="card small">No simple counter from their roster closes the gap. Declining is reasonable.</div>' : res.verdict === 'Counter' ? '<div class="card small">Close, but no single change from their roster fixes it. Ask them to improve the offer, or name what you\'d want.</div>' : ''}`;
+    <div class="row" style="margin-top:10px">${res.proposing ? offerButton(Object.assign(r, { partner: res.team })) : '<button class="btn ghost" id="ev-log">Log interest in my players</button>'}</div></div>
+    ${res.counters.length ? `<h3 style="margin:14px 0 4px;font-size:16px">${res.proposing ? 'Tweaks that might get it accepted' : res.verdict === 'Accept' ? 'You could still try' : 'Counter-offers'}</h3>${res.counters.map(counterCard).join('')}` : res.proposing ? (res.r.partnerU < 0.1 ? '<div class="card small">No simple addition from your tradeable assets makes this attractive to them. Try a different target or package.</div>' : '') : res.verdict === 'Decline' ? '<div class="card small">No simple counter from their roster closes the gap. Declining is reasonable.</div>' : res.verdict === 'Counter' ? '<div class="card small">Close, but no single change from their roster fixes it. Ask them to improve the offer, or name what you\'d want.</div>' : ''}`;
   bindOfferButtons($('#ev-out'));
-  $('#ev-log').onclick = () => {
+  if ($('#ev-log')) $('#ev-log').onclick = () => {
     const day = new Date().toISOString().slice(0, 10);
     for (const a of res.G) if (a.kind === 'player' && !INTEREST.some(i => i.playerId === a.id && i.ownerId === res.team.ownerId && i.day === day))
       INTEREST.unshift({ ts: Date.now(), day, ownerId: res.team.ownerId, teamName: res.team.name, playerId: a.id, playerName: a.name });
