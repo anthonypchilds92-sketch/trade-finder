@@ -1,22 +1,14 @@
-// One-off: find KTC's trade-calculator value-adjustment code
+// One-off: print KTC's trade-calculator value-adjustment functions
 const UA = 'Mozilla/5.0 (personal dynasty trade-finder)';
 const page = await (await fetch('https://keeptradecut.com/trade-calculator', { headers: { 'User-Agent': UA } })).text();
-console.log('page length', page.length);
-const srcs = [...page.matchAll(/<script[^>]+src=["']([^"']+)["']/g)].map(m => m[1]).filter(s => !/googletag|google-analytics|gtag|ads|cloudflare|jquery|bootstrap/i.test(s));
-console.log('scripts:', srcs.join('\n'));
-const inline = [...page.matchAll(/<script(?![^>]*src)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-const bodies = [['inline', inline.join('\n')]];
-for (const s of srcs) {
-  const url = s.startsWith('http') ? s : new URL(s, 'https://keeptradecut.com').href;
-  try { bodies.push([url, await (await fetch(url, { headers: { 'User-Agent': UA } })).text()]); } catch (e) { console.log('fail', url); }
+const src = (page.match(/<script[^>]+src=["']([^"']*site\.min\.js[^"']*)["']/) || [])[1];
+const body = await (await fetch(new URL(src, 'https://keeptradecut.com').href, { headers: { 'User-Agent': UA } })).text();
+const show = (label, start, len) => console.log(`\n##### ${label}\n` + body.slice(start, start + len));
+for (const name of ['processVNew', 'reverseAdjustNew', 'checkEquality']) {
+  const re = new RegExp(`(function\\s+${name}\\s*\\(|${name}\\s*=\\s*function|${name}\\s*=\\s*\\()`);
+  const m = body.match(re);
+  if (m) show(name, m.index, 1400); else console.log('not found:', name);
 }
-for (const [name, body] of bodies) {
-  for (const key of ['adjust', 'Adjust', 'valueAdj', 'raw', 'Math.pow', '**']) {
-    let i = 0, n = 0;
-    while ((i = body.indexOf(key, i)) !== -1 && n < 6) {
-      const ctx = body.slice(Math.max(0, i - 300), i + 500).replace(/\s+/g, ' ');
-      if (/adjust/i.test(ctx) || key === 'Math.pow') { console.log(`\n=== ${name} [${key}] @${i}\n${ctx}`); n++; }
-      i += key.length;
-    }
-  }
-}
+// The block that computes the adjustment (from the loop over team one's players to the end of the branch)
+const k = body.indexOf('teamOne.rawAdj=');
+show('calc block', Math.max(0, k - 1600), 4200);
