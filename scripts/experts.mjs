@@ -44,14 +44,27 @@ for (const [src, url] of FEEDS) {
     const res = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'application/rss+xml, application/xml, text/xml' } });
     if (!res.ok) { sources.push({ src, ok: false, status: res.status }); continue; }
     const xml = await res.text();
-    const items = xml.split(/<item[\s>]/i).slice(1);
+    const items = xml.split(/<item[\s>]/i).slice(1).map(it => ({
+      it, title: strip(tag(it, 'title')),
+      link: strip(tag(it, 'link')) || (it.match(/<guid[^>]*>([^<]+)/) || [])[1] || '',
+      when: Date.parse(tag(it, 'pubDate') || tag(it, 'dc:date')) || Date.now(),
+    })).filter(x => x.when >= since);
+    // Prioritise articles likely to contain value calls; skip DFS/betting/IDP
+    const RELEVANT = /buy|sell|stash|sleeper|breakout|riser|faller|waiver|dynasty|trade|target|stock|rookie|start.?sit|pickup|value|rankings?/i;
+    const SKIP = /\bdfs\b|betting|\bprops?\b|\bidp\b|survivor|parlay|odds/i;
+    items.sort((a, b) => (RELEVANT.test(b.title) - RELEVANT.test(a.title)) || b.when - a.when);
     let used = 0;
-    for (const it of items) {
-      const title = strip(tag(it, 'title'));
-      const link = strip(tag(it, 'link')) || (it.match(/<guid[^>]*>([^<]+)/) || [])[1] || '';
-      const when = Date.parse(tag(it, 'pubDate') || tag(it, 'dc:date')) || Date.now();
-      if (when < since) continue;
-      const text = strip(`${tag(it, 'title')}. ${tag(it, 'description')} ${tag(it, 'content:encoded')}`);
+    for (const { it, title, link, when } of items.filter(x => !SKIP.test(x.title)).slice(0, 12)) {
+      // Feeds usually carry only a summary, so read the article page itself (paragraph text only)
+      let body = `${tag(it, 'description')} ${tag(it, 'content:encoded')}`;
+      if (link && strip(body).length < 1500) {
+        try {
+          const page = await (await fetch(link, { headers: { 'User-Agent': UA } })).text();
+          const paras = [...page.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)].map(m => m[1]).join(' ');
+          if (strip(paras).length > strip(body).length) body = paras;
+        } catch {}
+      }
+      const text = strip(`${tag(it, 'title')}. ${body}`);
       if (!/nfl|football|fantasy|dynasty|waiver|rookie|trade/i.test(title + text.slice(0, 2000))) continue;
       used++;
       const titleTone = POS.test(title) ? 1 : NEG.test(title) ? -1 : 0;
@@ -79,7 +92,6 @@ for (const [src, url] of FEEDS) {
       }
     }
     sources.push({ src, ok: true, articles: used });
-    if (used) { const it0 = items[0]; console.log(`[${src}] sample text:`, strip(`${tag(it0, 'description')} ${tag(it0, 'content:encoded')}`).slice(0, 300)); }
   } catch (e) { sources.push({ src, ok: false, error: e.message }); }
 }
 
