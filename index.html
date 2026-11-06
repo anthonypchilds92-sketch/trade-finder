@@ -594,7 +594,8 @@ const ENGINE = (() => {
     const myAssetScore = a => {
       if (a.injStash && prefs.injuryStash !== false) return Math.max(a.future, a.injRebound) * 1.1;
       if (a.buyLow && prefs.buyLow !== false) return Math.max(a.future, a.rebound) * (1.15 * (0.85 + 0.3 * a.dipFatigue));
-      return a.future * (1 + 0.35 * a.breakout);
+      // Same strategy lens on what you receive as on what you give (a rebuild discounts veterans either way)
+      return stratFuture(a, me.strategy) * (1 + 0.35 * a.breakout);
     };
     // A manager whose player dipped recently still anchors to the old price; after a long dip they let go.
     const anchored = a => a.buyLow ? 1 + a.dropPct * (1 - a.dipFatigue) : 1;
