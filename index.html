@@ -1698,12 +1698,26 @@ function renderLeague() {
   </tbody></table><p class="small">"Lineup" is this season's value of each team's best possible starting lineup. "Roster age" is weighted by value.</p></div>`;
   const log = MODEL.tradeLog || [];
   const seasons = [...new Set(log.map(e => e.season))];
+  // Grade every trade on today's values (package-adjusted, so 2-for-1s are judged fairly)
+  const gradeOf = pct => pct >= 0.3 ? 'A+' : pct >= 0.15 ? 'A' : pct >= 0.05 ? 'B+' : pct > -0.05 ? 'B' : pct > -0.15 ? 'C' : pct > -0.3 ? 'D' : 'F';
+  const gradeCol = g => g.startsWith('A') ? 'var(--good)' : g === 'B+' || g === 'B' ? 'var(--accent)' : g === 'C' ? 'var(--warn)' : 'var(--bad)';
+  const record = new Map();
+  for (const e of log) {
+    for (const sd of e.sides) {
+      const got = ENGINE.packageValue(sd.got), gave = ENGINE.packageValue(sd.gave);
+      sd.net = got - gave; sd.pct = sd.net / Math.max(got, gave, 1); sd.grade = gradeOf(sd.pct);
+      if (sd.team) { const r = record.get(sd.team) || { w: 0, l: 0, d: 0, net: 0 }; Math.abs(sd.pct) < 0.05 ? r.d++ : sd.net > 0 ? r.w++ : r.l++; r.net += sd.net; record.set(sd.team, r); }
+    }
+    const best = e.sides.slice().sort((a, b) => b.net - a.net)[0];
+    e.verdict = Math.abs(best.pct) < 0.05 ? 'Even trade, nobody clearly won' : `${best.teamName} won by ${fmt(best.net)} (${Math.round(best.pct * 100)}%)`;
+  }
   const profHtml = `<h3 style="margin:18px 0 4px;font-size:16px">Manager trade tendencies</h3>
   <p class="small">${log.length ? `From ${log.length} completed trade${log.length === 1 ? '' : 's'} (${seasons.join(', ')}). These tendencies feed into the trade scores, and managers who trade more often rank a little higher. Values are today's, so they show what kind of assets moved, not what they were worth at the time.` : 'No completed trades found in this league yet. Profiles will fill in as trades happen.'}</p>
-  ${log.length ? `<div class="card">${MODEL.teams.slice().sort((a, b) => b.profile.trades - a.profile.trades).map(t => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(t.name)}</b>${t === MODEL.me ? ' <span class="tag buy">you</span>' : ''} <span class="small">· ${t.profile.trades} trade${t.profile.trades === 1 ? '' : 's'}</span><div>${t.profile.tags.map(g => `<span class="pill" style="margin:3px 4px 0 0">${esc(g)}</span>`).join('')}</div></div>`).join('')}</div>
+  ${log.length ? `<div class="card">${MODEL.teams.slice().sort((a, b) => b.profile.trades - a.profile.trades).map(t => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(t.name)}</b>${t === MODEL.me ? ' <span class="tag buy">you</span>' : ''} <span class="small">· ${t.profile.trades} trade${t.profile.trades === 1 ? '' : 's'}${record.get(t) ? ` · record ${record.get(t).w}–${record.get(t).l}${record.get(t).d ? '–' + record.get(t).d : ''} · net ${record.get(t).net >= 0 ? '+' : ''}${fmt(record.get(t).net)}` : ''}</span><div>${t.profile.tags.map(g => `<span class="pill" style="margin:3px 4px 0 0">${esc(g)}</span>`).join('')}</div></div>`).join('')}</div>
   <h3 style="margin:18px 0 4px;font-size:16px">Recent trades</h3>
-  ${log.slice(0, 12).map(e => `<div class="card"><div class="small" style="margin-bottom:6px">${e.when ? new Date(e.when).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : e.season}</div>
-    <div class="sides">${e.sides.map(sd => `<div class="side"><h4>${esc(sd.teamName)} got</h4>${sd.got.length ? sd.got.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}</div><div class="meta">${a.kind === 'pick' ? 'Draft pick' : esc(a.pos) + (a.age ? ' · ' + Math.floor(a.age) + ' then' : '')}</div></div><div class="val">${fmt(a.value)}</div></div>`).join('') : '<div class="small">Nothing</div>'}</div>`).join('')}</div></div>`).join('')}` : ''}`;
+  <p class="small">Graded on today's values, with hindsight: what each side got against what they gave, adjusted so a 2-for-1 is judged fairly. A+ means a clear win, B is about even, F is a fleecing. Record is wins–losses(–evens).</p>
+  ${log.slice(0, 12).map(e => `<div class="card"><div class="trade-top"><span class="small">${e.when ? new Date(e.when).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : e.season}</span><span class="small"><b>${esc(e.verdict)}</b></span></div>
+    <div class="sides">${e.sides.map(sd => `<div class="side"><h4 style="display:flex;justify-content:space-between"><span>${esc(sd.teamName)} got</span><span style="font-size:18px;color:${gradeCol(sd.grade)};letter-spacing:0">${sd.grade}</span></h4>${sd.got.length ? sd.got.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}</div><div class="meta">${a.kind === 'pick' ? 'Draft pick' : esc(a.pos) + (a.age ? ' · ' + Math.floor(a.age) + ' then' : '')}</div></div><div class="val">${fmt(a.value)}</div></div>`).join('') : '<div class="small">Nothing</div>'}</div>`).join('')}</div></div>`).join('')}` : ''}`;
   $('#tab-league').insertAdjacentHTML('beforeend', profHtml);
   $('#tab-league').querySelectorAll('select').forEach(s => s.onchange = () => { prefs.strategy[s.dataset.r] = s.value; savePrefs(); rebuild(); });
 }
