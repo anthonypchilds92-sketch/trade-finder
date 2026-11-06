@@ -84,6 +84,7 @@
       <button data-tab="trades" class="on">Top trades</button>
       <button data-tab="week">This week</button>
       <button data-tab="targets">Targets</button>
+      <button data-tab="fa">Free agents</button>
       <button data-tab="myteam">My team</button>
       <button data-tab="league">League</button>
       <button data-tab="evaluate">Evaluate</button>
@@ -99,6 +100,7 @@
   <section id="tab-trades"></section>
   <section id="tab-week" class="hidden"></section>
   <section id="tab-targets" class="hidden"></section>
+  <section id="tab-fa" class="hidden"></section>
   <section id="tab-myteam" class="hidden"></section>
   <section id="tab-league" class="hidden"></section>
   <section id="tab-evaluate" class="hidden"></section>
@@ -543,7 +545,8 @@ const ENGINE = (() => {
       t.players = t.assets.filter(a => a.kind === 'player');
     }
     const tradeLog = buildTendencies(input.tradeHistory, teams, { fcById, sleeperPlayers, pickValue });
-    return { league, slots, season, teams, teamById, players, picks, me, haveStats, haveTrending: trendMap.size > 0, histSpan: hist?.span || 0, tradeLog };
+    return { league, slots, season, teams, teamById, players, picks, me, haveStats, haveTrending: trendMap.size > 0, histSpan: hist?.span || 0, tradeLog,
+      fcById, sleeperPlayers, trendMap, statMap, maxTrend, rostered: new Set(teams.flatMap(t => t.playerIds)) };
   }
 
   const STRAT_W = { winnow: { now: 1.0, fut: 0.25 }, middle: { now: 0.6, fut: 0.6 }, rebuild: { now: 0.12, fut: 1.0 } };
@@ -766,6 +769,111 @@ const ENGINE = (() => {
       if (out.length >= (prefs.maxResults ?? 20)) break;
     }
     return out;
+  }
+
+  // Swap in KTC values (or a 50/50 blend) for FantasyCalc's, keeping FantasyCalc's redraft values and trends
+  function applyValues(RAW, src = 'ktc') {
+    const K = RAW.ktc;
+    if (src === 'fc' || !K?.values) return { ...RAW, valueLabel: 'FantasyCalc' };
+    const tePrem = (RAW.league.scoring_settings?.bonus_rec_te || 0) > 0;
+    const kv = (id, pos) => { const x = K.values[id]; if (!x) return null; return pos === 'TE' && tePrem && x.tep ? x.tep : x.v; };
+    // Scale for players KTC doesn't list, so they sit on the same scale
+    const ratios = RAW.fc.filter(r => r.player?.sleeperId && K.values[r.player.sleeperId] && r.value > 500).map(r => kv(String(r.player.sleeperId), r.player.position) / r.value).sort((a, b) => a - b);
+    const scale = ratios.length ? ratios[Math.floor(ratios.length / 2)] : 1;
+    const seen = new Set();
+    const rows = [];
+    for (const r of RAW.fc) {
+      if (r.player?.position === 'PICK') { if (src === 'blend') rows.push(r); continue; }
+      const id = r.player?.sleeperId ? String(r.player.sleeperId) : null;
+      const k = id ? kv(id, r.player.position) : null;
+      const fcv = r.value * scale;
+      const v = k == null ? fcv : src === 'blend' ? (k + r.value) / 2 : k;
+      if (id) seen.add(id);
+      rows.push({ ...r, value: v, trend30Day: (r.trend30Day || 0) * (v / Math.max(1, r.value)) });
+    }
+    // Players KTC values that FantasyCalc doesn't list
+    for (const [id, x] of Object.entries(K.values)) {
+      if (seen.has(id)) continue;
+      const sp = RAW.sleeperPlayers?.[id] || {};
+      const pos = sp.position || '?';
+      rows.push({ player: { name: x.name, sleeperId: id, position: pos, maybeAge: sp.age ?? null, maybeTeam: sp.team || null, maybeYoe: sp.years_exp ?? null }, value: kv(id, pos), redraftValue: kv(id, pos) * 0.55, trend30Day: 0 });
+    }
+    for (const pk of K.picks || []) rows.push({ player: { name: pk.name, position: 'PICK' }, value: pk.value });
+    const history = src === 'ktc' && RAW.historyKtc?.dates?.length ? RAW.historyKtc : RAW.history;
+    return { ...RAW, fc: rows, history, valueLabel: src === 'blend' ? 'KTC + FantasyCalc blend' : 'KTC' };
+  }
+
+  // ---- Free agents worth picking up ----
+  function freeAgents(model, prefs) {
+    const sp = model.sleeperPlayers;
+    if (!sp) return { list: [], reason: 'Player details from Sleeper are needed for free agents.' };
+    const OUTR = /^(IR|PUP|OUT|SUS|NFI|DOUBTFUL)/i;
+    // Depth charts: team|pos -> players in order
+    const depth = {};
+    for (const [id, p] of Object.entries(sp)) {
+      if (!p.team || p.depth_chart_order == null || !SKILL.includes(p.position)) continue;
+      const dp = p.depth_chart_position && SKILL.includes(p.depth_chart_position) ? p.depth_chart_position : p.position;
+      (depth[`${p.team}|${dp}`] ??= []).push({ id: String(id), order: p.depth_chart_order, p });
+    }
+    for (const k in depth) depth[k].sort((a, b) => a.order - b.order);
+    const nameOf = p => p.full_name || `${p.first_name || ''} ${p.last_name || ''}`.trim();
+    const me = model.me;
+    const rebuild = me.strategy === 'rebuild';
+    const W = rebuild ? { opp: 0.25, buzz: 0.15, value: 0.25, youth: 0.25, prod: 0.1 } : { opp: 0.35, buzz: 0.2, value: 0.15, youth: 0.05, prod: 0.25 };
+    const out = [];
+    for (const [id0, p] of Object.entries(sp)) {
+      const id = String(id0);
+      if (model.rostered.has(id) || !p.active || !p.team || !SKILL.includes(p.position)) continue;
+      const f = model.fcById.get(id);
+      const value = f?.value ?? 0;
+      const adds = model.trendMap.get(id) || 0;
+      const st = model.statMap.get(id);
+      const ppg = st && (st.gp || 0) >= 2 ? (st.pts_half_ppr ?? st.pts_ppr ?? 0) / st.gp : null;
+      const age = f?.player.maybeAge ?? p.age ?? null;
+      const yoe = p.years_exp ?? f?.player.maybeYoe ?? null;
+      // Opportunity from the depth chart
+      const dp = p.depth_chart_position && SKILL.includes(p.depth_chart_position) ? p.depth_chart_position : p.position;
+      const grp = depth[`${p.team}|${dp}`] || [];
+      const idx = grp.findIndex(x => x.id === id);
+      let opp = 0, oppNote = null;
+      const starters = { QB: 1, RB: 1, WR: 3, TE: 1 }[p.position] || 1;
+      const selfOut = OUTR.test(p.injury_status || '') || p.status === 'Injured Reserve';
+      if (idx >= 0 && !selfOut) {
+        const ahead = grp.slice(0, idx);
+        const healthyAhead = ahead.filter(x => !OUTR.test(x.p.injury_status || '') && x.p.status !== 'Injured Reserve');
+        if (idx < starters) { opp = 0.8; oppNote = `listed as a starter (${p.position}${idx + 1}) on the ${p.team} depth chart`; }
+        if (healthyAhead.length < starters && ahead.length >= healthyAhead.length + 1 && idx < starters + 2) {
+          const hurt = ahead.filter(x => !healthyAhead.includes(x)).map(x => `${nameOf(x.p)} (${x.p.injury_status || 'IR'})`);
+          opp = 1; oppNote = `next man up: ${hurt.join(', ')} ${hurt.length > 1 ? 'are' : 'is'} out ahead of him on ${p.team}`;
+        } else if (!oppNote && p.position === 'RB' && idx === 1) { opp = 0.4; oppNote = `${p.team}'s RB2, one injury from a starting role`; }
+      }
+      const buzz = adds ? Math.log1p(adds) / Math.log1p(model.maxTrend || 1) : 0;
+      const youth = age == null ? 0 : age <= 23 ? 1 : age <= 25 ? 0.6 : age <= 27 ? 0.2 : 0;
+      const prod = ppg == null ? 0 : clamp(ppg / 14);
+      const vScore = clamp(value / 2500);
+      const score = W.opp * opp + W.buzz * buzz + W.value * vScore + W.youth * youth + W.prod * prod;
+      if (score < 0.18 && value < 400) continue;
+      const est = value + 900 * opp + 500 * buzz + (rebuild ? 400 * youth : 300 * prod);
+      const notes = [];
+      if (oppNote) notes.push(oppNote);
+      if (adds >= 500) notes.push(`${fmt(adds)} adds on Sleeper in the last 72h`);
+      if (ppg != null && ppg >= 6) notes.push(`${ppg.toFixed(1)} pts per game`);
+      if (age != null) notes.push(`age ${Math.floor(age)}${yoe === 0 ? ', rookie' : ''}`);
+      if (value) notes.push(`value ${fmt(value)}`);
+      out.push({ id, name: nameOf(p), pos: p.position, team: p.team, age, value, adds, ppg, opp, score, est, notes, injury: p.injury_status || null });
+    }
+    out.sort((a, b) => b.score - a.score);
+    const list = out.slice(0, 25);
+    // Drop candidates: your least valuable players (not protected, not injury stashes / buy-low holds)
+    const mark = prefs.marks || {};
+    const drops = me.players.filter(p => mark[p.id] !== 'protect' && !p.injStash && !p.dip && (p.breakout ?? 0) < 0.55)
+      .sort((a, b) => (a.value + 0.5 * a.future) - (b.value + 0.5 * b.future));
+    let di = 0;
+    for (const fa of list) {
+      const d = drops[di];
+      if (d && fa.est > d.value * 1.25 + 150) { fa.drop = d; di++; }
+    }
+    return { list };
   }
 
   // ---- Evaluate an offer someone sent you ----
@@ -1079,7 +1187,7 @@ const ENGINE = (() => {
   }
   const fmt = x => Math.round(x).toLocaleString('en-GB');
 
-  return { buildModel, generateTrades, offersFor, asksFor, weeklyNeeds, evaluateIncoming, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
+  return { buildModel, applyValues, generateTrades, offersFor, asksFor, weeklyNeeds, evaluateIncoming, freeAgents, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
 })();
 if (typeof module !== 'undefined') module.exports = ENGINE;
 /*ENGINE-END*/
@@ -1183,14 +1291,16 @@ async function load(force) {
     status('Loading player details, season stats and trade history…');
     RAW_ROSTERS = rosters.map(r => ({ roster_id: r.roster_id, owner_id: r.owner_id }));
     const season = nfl?.season || league.season;
-    const [sleeperPlayers, stats, history, weekInfo, tradeHistory] = await Promise.all([
+    const [sleeperPlayers, stats, history, weekInfo, ktc, historyKtc, tradeHistory] = await Promise.all([
       soft(force ? getJSON(`${SLEEPER}/players/nfl`) : cached('players', 86400000, () => getJSON(`${SLEEPER}/players/nfl`))),
       soft(getJSON(`${SLEEPER}/stats/nfl/regular/${season}`).catch(() => getJSON(`https://api.sleeper.com/stats/nfl/${season}?season_type=regular`))),
       soft(fetch('data/history.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(fetch('data/week.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
+      soft(fetch('data/ktc.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
+      soft(fetch('data/history-ktc.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(loadTradeHistory(league, nfl?.week)),
     ]);
-    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo };
+    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc };
     rebuild();
     const missing = [!tradeHistory && 'trade history', !stats && 'season stats', !trending && 'trending adds', !sleeperPlayers && 'player details'].filter(Boolean);
     status(`Updated ${new Date().toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` + (missing.length ? ` · couldn't load ${missing.join(', ')}, so those signals are skipped` : ''));
@@ -1200,14 +1310,16 @@ async function load(force) {
   }
 }
 
+function valueInput() { return ENGINE.applyValues(RAW, prefs.valueSource || 'ktc'); }
+
 function rebuild() {
-  MODEL = ENGINE.buildModel(RAW, prefs);
+  MODEL = ENGINE.buildModel(valueInput(), prefs);
   autoDetectAccepted();
   LEARN = ENGINE.learnFromOffers(OFFERS, INTEREST);
   CARDS.length = 0;
   $('#title').textContent = RAW.league.name;
   $('#subtitle').textContent = `${MODEL.me.name} · ${MODEL.me.wins}–${MODEL.me.losses} · strategy: ${label(MODEL.me.strategy)}${RAW.week ? ` · week ${RAW.week}` : ''}`;
-  renderTrades(); renderWeek(); renderTargets(); renderMyTeam(); renderLeague(); renderEvaluate(); renderOffers(); renderSettings();
+  renderTrades(); renderWeek(); renderTargets(); renderFA(); renderMyTeam(); renderLeague(); renderEvaluate(); renderOffers(); renderSettings();
 }
 const label = s => ({ winnow: 'Win now', middle: 'Middle', rebuild: 'Rebuild' }[s]);
 const stratPill = t => `<span class="pill ${t.strategy}">${label(t.strategy)}</span>`;
@@ -1217,7 +1329,7 @@ function renderTrades() {
   const trades = ENGINE.generateTrades(MODEL, P());
   const el = $('#tab-trades');
   if (!trades.length) { el.innerHTML = `<div class="card">No trades pass the filters right now. Try widening the fairness range or marking more players as "Shop" in My team.</div>`; return; }
-  el.innerHTML = `<p class="small">Ranked by how much each deal helps your rebuild, with a check that the other side would want it too. Values are FantasyCalc dynasty values for your format.</p>` +
+  el.innerHTML = `<p class="small">Ranked by how much each deal helps your rebuild, with a check that the other side would want it too. Values: ${esc(valueInput().valueLabel)}${(prefs.valueSource || 'ktc') !== 'fc' && RAW.ktc?.date ? ` (KTC from ${RAW.ktc.date})` : ''}.</p>` +
     trades.map((tr, i) => {
       const side = (title, list) => `<div class="side"><h4>${title}</h4>${list.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}${a.injStash && tr.get.includes(a) ? '<span class="tag hot">injury stash</span>' : a.buyLow && tr.get.includes(a) ? '<span class="tag buy">buy low</span>' : a.breakout >= 0.55 && a.kind === 'player' ? '<span class="tag hot">breakout</span>' : ''}</div><div class="meta">${esc(assetMeta(a))}</div></div><div class="val">${fmt(a.value)}</div></div>`).join('')}</div>`;
       const d = Math.max(-0.3, Math.min(0.3, tr.diff));
@@ -1318,6 +1430,17 @@ function renderEvaluate() {
     saveInterest(); LEARN = ENGINE.learnFromOffers(OFFERS, INTEREST); renderOffers();
     $('#ev-log').outerHTML = '<span class="pill" style="color:var(--good)">Interest logged</span>';
   };
+}
+
+function renderFA() {
+  const el = $('#tab-fa');
+  const { list, reason } = ENGINE.freeAgents(MODEL, P());
+  if (reason) { el.innerHTML = `<div class="card small">${esc(reason)}</div>`; return; }
+  el.innerHTML = `<p class="small">Unrostered players ranked for ${MODEL.me.strategy === 'rebuild' ? 'a rebuild (youth and long-term value count more)' : 'your team'}. Players moving up the depth chart because someone ahead of them is out are flagged as <b>next man up</b>. Where a pickup beats one of your weakest players, a drop is suggested. Check whether he's on waivers in Sleeper before you claim.</p>
+  ${list.length ? list.map(fa => `<div class="card"><div class="trade-top"><div><b>${esc(fa.name)}</b> <span class="small">${esc(fa.pos)} · ${esc(fa.team)}${fa.injury ? ' · ' + esc(fa.injury) : ''}</span>${fa.opp >= 1 ? '<span class="tag hot">next man up</span>' : fa.opp >= 0.8 ? '<span class="tag buy">starter</span>' : ''}${fa.adds >= 2000 ? '<span class="tag hot">trending</span>' : ''}</div><div class="bar" style="width:70px"><span style="width:${Math.round(fa.score * 100)}%"></span></div></div>
+    <div class="small">${fa.notes.map(esc).join(' · ')}</div>
+    ${fa.drop ? `<div style="margin-top:6px">Add him, drop <b>${esc(fa.drop.name)}</b> <span class="small">(${esc(fa.drop.pos)}, value ${fmt(fa.drop.value)})</span></div>` : ''}</div>`).join('')
+  : '<div class="card small">No free agents stand out right now.</div>'}`;
 }
 
 function renderTargets() {
@@ -1583,6 +1706,8 @@ function renderLeague() {
 
 function renderSettings() {
   $('#tab-settings').innerHTML = `<div class="card">
+    <label class="set"><span>Player values<div class="small">KTC is read once a day by your GitHub job. FantasyCalc is based on real trades.</div></span>
+      <select id="s-src">${[['ktc', 'KTC'], ['blend', 'Blend (50/50)'], ['fc', 'FantasyCalc']].map(([v, l]) => `<option value="${v}" ${(prefs.valueSource || 'ktc') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     <label class="set"><span>Fairness range<div class="small">How far apart the two sides' market values can be</div></span>
       <select id="s-fair">${[0.06, 0.1, 0.12, 0.15, 0.2].map(v => `<option value="${v}" ${prefs.fairness == v ? 'selected' : ''}>±${Math.round(v * 100)}%</option>`).join('')}</select></label>
     <label class="set"><span>Even deals<div class="small">Same number of pieces on each side</div></span>
@@ -1597,8 +1722,9 @@ function renderSettings() {
     <label class="set"><span>Number of trades to show</span>
       <select id="s-n">${[10, 20, 30].map(v => `<option ${prefs.maxResults == v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
     <div class="row" style="margin-top:10px"><button class="btn ghost" id="s-reset">Reset strategies and marks</button></div>
-    <p class="small">Data: Sleeper (rosters, picks, stats, trending adds) and <a href="https://fantasycalc.com" target="_blank" rel="noopener">FantasyCalc</a> (trade values). Settings are saved in this browser only.</p>
+    <p class="small">Data: Sleeper (rosters, picks, stats, trending adds) and <a href="https://fantasycalc.com" target="_blank" rel="noopener">FantasyCalc</a> (trade values, based on real trades) and KeepTradeCut (crowd values, read daily). Settings are saved in this browser only.</p>
   </div>`;
+  $('#s-src').onchange = e => { prefs.valueSource = e.target.value; savePrefs(); rebuild(); };
   $('#s-fair').onchange = e => { prefs.fairness = +e.target.value; savePrefs(); rebuild(); };
   $('#s-even').onchange = e => { prefs.evenDeals = e.target.value; savePrefs(); rebuild(); };
   $('#s-max').onchange = e => { prefs.maxAssets = +e.target.value; savePrefs(); rebuild(); };

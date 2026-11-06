@@ -32,6 +32,9 @@ const [users, rosters, tradedPicks, fc, trending, sleeperPlayers, stats] = await
   soft(get(`${S}/stats/nfl/regular/${season}`)),
 ]);
 let history = null; try { history = JSON.parse(await readFile('data/history.json', 'utf8')); } catch {}
+let ktc = null, historyKtc = null;
+try { ktc = JSON.parse(await readFile('data/ktc.json', 'utf8')); } catch {}
+try { historyKtc = JSON.parse(await readFile('data/history-ktc.json', 'utf8')); } catch {}
 
 // Byes: teams with no game this week. Try Sleeper's schedule, then ESPN's scoreboard.
 async function byeTeams() {
@@ -51,7 +54,8 @@ async function byeTeams() {
 const byes = await byeTeams();
 
 const prefs = { fairness: 0.12, maxAssets: 2, protectPicks: true, strategy: {}, marks: {}, evenDeals: 'prefer' };
-const model = ENGINE.buildModel({ league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, history }, prefs);
+const input = ENGINE.applyValues({ league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, history, ktc, historyKtc }, 'ktc');
+const model = ENGINE.buildModel(input, prefs);
 const others = [...model.players.values()].filter(p => p.owner !== model.me.rosterId);
 const buyLows = others.filter(p => p.buyLow), stashes = others.filter(p => p.injStash);
 
@@ -84,10 +88,13 @@ L.push('', '### New buy-low candidates');
 L.push(newBL.length ? newBL.map(p => `- **${p.name}** (${p.pos}, ${Math.floor(p.age)}), ${team(p.owner)}: ${fmt(p.value)}, down ${Math.round(p.dropPct * 100)}%${p.dipDays != null ? ` over ${p.dipDays} days` : ' in 30 days'}`).join('\n') : 'None since last week.');
 L.push('', '### New injury stashes');
 L.push(newST.length ? newST.map(p => `- **${p.name}** (${p.pos}, ${Math.floor(p.age)}), ${team(p.owner)}: ${p.injury}${p.injuryBody ? ` (${p.injuryBody})` : ''}, ${fmt(p.value)} now, about ${fmt(p.injRebound / p.ageMult)} once healthy`).join('\n') : 'None since last week.');
+const fa = ENGINE.freeAgents(model, prefs).list.slice(0, 5);
+L.push('', '### Free agents to watch');
+L.push(fa.length ? fa.map(f => `- **${f.name}** (${f.pos}, ${f.team}): ${f.notes.join(' · ')}${f.drop ? ` → add, drop ${f.drop.name}` : ''}`).join('\n') : 'Nobody stands out.');
 const top = ENGINE.generateTrades(model, prefs).slice(0, 3);
 L.push('', '### Top 3 trades right now');
 L.push(top.length ? top.map(t => `- **${t.partner.name}**: send ${t.give.map(a => a.name).join(' + ')}, get ${t.get.map(a => a.name).join(' + ')}`).join('\n') : 'None pass the filters right now.');
-L.push('', '_Uses default settings. Your own Protect/Shop marks and strategy changes apply on the site._');
+L.push('', '_Uses KTC values and default settings. Your own Protect/Shop marks and strategy changes apply on the site._');
 L.push('', 'cc @anthonypchilds92-sketch');
 await writeFile('roundup.md', L.join('\n'));
 console.log(L.join('\n'));
