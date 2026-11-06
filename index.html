@@ -542,16 +542,27 @@ const ENGINE = (() => {
       if (pickOwner.has(k)) pickOwner.set(k, tp.owner_id);
     }
     const picks = new Map();
+    // Projected draft slot for next year's picks: worst current record (then fewest points) picks first
+    const standing = teams.slice().sort((a, b) => a.winPct - b.winPct || a.pf - b.pf);
+    standing.forEach((t, i) => { t.projSlot = i + 1; });
+    // Pick values come from a source sized for `base` teams (KTC: 12). Map our overall pick number onto it.
+    const base = input.pickTeams || n;
+    const ORD = ['', '1st', '2nd', '3rd', '4th', '5th', '6th'];
     for (const [k, owner] of pickOwner) {
       const [s, r, orig] = k.split(':');
       const origTeam = teamById.get(+orig);
-      let tier = 'generic';
-      if (s === seasons[0]) tier = origTeam.contendRank > n - Math.round(n * 0.3) ? 'early' : origTeam.contendRank <= Math.round(n * 0.3) ? 'late' : 'mid';
-      const value = pickValue(s, +r, tier) * (s === seasons[2] ? 0.95 : 1);
-      const ord = ['', '1st', '2nd', '3rd', '4th', '5th'][+r] || `R${r}`;
-      const label = `${s} ${tier !== 'generic' ? tier[0].toUpperCase() + tier.slice(1) + ' ' : ''}${ord}` + (+orig !== owner ? ` (from ${origTeam.name})` : '');
+      const projected = s === seasons[0];
+      const slot = projected ? origTeam.projSlot : (n + 1) / 2;
+      const overall = (+r - 1) * n + slot;
+      const r2 = Math.ceil(overall / base), s2 = overall - (r2 - 1) * base;
+      const tier = s2 <= base / 3 ? 'early' : s2 <= (2 * base) / 3 ? 'mid' : 'late';
+      const value = pickValue(s, r2, projected || base !== n ? tier : 'generic') * (s === seasons[2] ? 0.95 : 1);
+      const ord = ORD[+r] || `R${r}`;
+      const slotTxt = projected ? `${r}.${String(Math.round(slot)).padStart(2, '0')}` : null;
+      const equiv = base !== n || projected ? `${tier} ${ORD[r2] || 'R' + r2}${base !== n ? ` in a ${base}-team draft` : ''}` : null;
+      const label = `${s} ${ord}` + (slotTxt ? ` (proj. ${slotTxt})` : '') + (+orig !== owner ? ` from ${origTeam.name}` : '');
       picks.set(`pick:${k}`, {
-        id: `pick:${k}`, kind: 'pick', owner, name: label, pos: 'PICK', season: s, round: +r, origRoster: +orig,
+        id: `pick:${k}`, kind: 'pick', owner, name: label, pos: 'PICK', season: s, round: +r, origRoster: +orig, equiv,
         value, now: 0, future: value * 1.05, age: null, ageMult: 1, breakout: +r === 1 ? 0.35 : 0.15, sell: 0, trend: 0, signals: {}, dropPct: 0, dipFatigue: 0,
       });
     }
@@ -592,6 +603,35 @@ const ENGINE = (() => {
     return Math.pow(assets.reduce((s, a) => s + Math.pow(Math.max(0, a.value), k), 0), 1 / k);
   }
   const rawValue = assets => assets.reduce((s, a) => s + a.value, 0);
+
+  // KeepTradeCut's trade-calculator value adjustment. Each piece is re-weighted against the best single
+  // piece in the whole trade; the side with the better weighted total gets a "value adjustment" added,
+  // converted back into raw value. Returns effective totals for each side.
+  const KTC_TOP = 10099;
+  const ktcAdj = (v, r) => (0.1 * Math.pow(v / KTC_TOP, 1.4) + 0.7 * Math.pow(v / (1.05 * r), 1.25) + 0.2) * v;
+  function ktcInverse(target, r) { // solve ktcAdj(x, r) = target (Newton's method, as KTC does)
+    if (target <= 0) return 0;
+    let x = Math.min(5 * target, 3 * r);
+    for (let i = 0; i < 30; i++) {
+      const f = ktcAdj(x, r) - target;
+      const d = 0.24 * Math.pow(x, 1.4) / Math.pow(KTC_TOP, 1.4) + 1.575 * Math.pow(x, 1.25) / (Math.pow(1.05, 1.25) * Math.pow(r, 1.25)) + 0.2;
+      const nx = Math.max(0, x - f / d);
+      if (Math.abs(nx - x) < 1e-6) return nx;
+      x = nx;
+    }
+    return x;
+  }
+  function ktcCompare(A, B) {
+    const ra = rawValue(A), rb = rawValue(B);
+    const r = Math.max(1, ...A.map(a => a.value), ...B.map(b => b.value));
+    const sa = A.reduce((s, a) => s + ktcAdj(Math.max(0, a.value), r), 0);
+    const sb = B.reduce((s, b) => s + ktcAdj(Math.max(0, b.value), r), 0);
+    const x = ktcInverse(Math.abs(sa - sb), r);
+    let adjA = 0, adjB = 0;
+    if (sa > sb) { const b = rb + x - ra; if (b > 0) adjA = b; else adjB = -b; }
+    else if (sb > sa) { const b = ra + x - rb; if (b > 0) adjB = b; else adjA = -b; }
+    return { a: ra + adjA, b: rb + adjB, rawA: ra, rawB: rb, adjA, adjB };
+  }
 
   // ---- Learning from offers you've sent ----
   // offers: [{ownerId, partnerName, give:[{id,name,value}], get:[...], status:'open'|'accepted'|'rejected'|'withdrawn', reason}]
@@ -659,9 +699,10 @@ const ENGINE = (() => {
 
   function evaluate(model, ctx, t, G, R, opts = {}) {
     const { me, tol } = ctx;
-    const gv = packageValue(G), rv = packageValue(R);
+    const kc = ktcCompare(G, R);
+    const gv = kc.a, rv = kc.b;
     const diff = (rv - gv) / Math.max(rv, gv, 1); // + means I receive more market value
-    const res = { partner: t, give: G, get: R, gv, rv, diff, ok: true, why: [] };
+    const res = { partner: t, give: G, get: R, gv, rv, diff, ok: true, why: [], kc };
     const fail = m => { res.ok = false; res.fail = m; return res; };
     if (Math.abs(diff) > tol) if (!opts.noChecks) return fail(diff > 0 ? 'they lose too much market value' : 'you overpay');
     const topGive = Math.max(...G.map(a => a.value)), topGet = Math.max(...R.map(a => a.value));
@@ -816,7 +857,7 @@ const ENGINE = (() => {
     }
     for (const pk of K.picks || []) rows.push({ player: { name: pk.name, position: 'PICK' }, value: pk.value });
     const history = src === 'ktc' && RAW.historyKtc?.dates?.length ? RAW.historyKtc : RAW.history;
-    return { ...RAW, fc: rows, history, valueLabel: src === 'blend' ? 'KTC + FantasyCalc blend' : 'KTC' };
+    return { ...RAW, fc: rows, history, pickTeams: src === 'ktc' ? 12 : undefined, valueLabel: src === 'blend' ? 'KTC + FantasyCalc blend' : 'KTC' };
   }
 
   // ---- Free agents worth picking up ----
@@ -1062,7 +1103,9 @@ const ENGINE = (() => {
     const theirBefore = ctx.theirBefore.get(t.rosterId).total;
     const cands = [];
     for (const R of combos(pool, 2)) {
-      const rv = packageValue(R);
+      // KTC-adjusted value of their package, on the same scale as your player's price
+      const kc = ktcCompare([a], R);
+      const rv = a.value > 0 ? kc.b * (basis / Math.max(1, kc.a)) : packageValue(R);
       if (rv < floor * 0.97 || rv > floor * 1.45) continue;
       const rIds = new Set(R.map(x => x.id));
       const theirAfter = lineupValue(t.players.filter(p => !rIds.has(p.id)).concat(a.kind === 'player' ? [a] : []), model.slots).total;
@@ -1139,8 +1182,9 @@ const ENGINE = (() => {
     if (tr.tendency?.length) why.push(`Their trade history: ${tr.tendency.join('; ')}.`);
     if (tr.learned?.length) why.push(`From your past offers: ${tr.learned.join('; ')}.`);
     const pct = Math.round(tr.diff * 100);
-    const side = (list, eff) => list.length > 1 ? `${fmt(rawValue(list))} (worth ${fmt(eff)} as a package)` : fmt(eff);
-    why.push(`Market check: you give ${side(tr.give, tr.gv)}, you get ${side(tr.get, tr.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${pct}% their way`}).`);
+    const k = tr.kc;
+    const adjTxt = k && (k.adjA > 1 || k.adjB > 1) ? `, plus KTC's value adjustment of ${fmt(Math.max(k.adjA, k.adjB))} to ${k.adjA > 1 ? 'your' : 'their'} side` : '';
+    why.push(`Market check: you give ${fmt(k ? k.rawA : tr.gv)}, you get ${fmt(k ? k.rawB : tr.rv)}${adjTxt} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${-pct}% their way`}).`);
     return why;
   }
   // Why the other manager might say yes (used by the offer builder)
@@ -1161,7 +1205,9 @@ const ENGINE = (() => {
     if (r.tendency?.length) out.push(`Their trade history: ${r.tendency.join('; ')}.`);
     if (r.learned?.length) out.push(`From your past offers: ${r.learned.join('; ')}.`);
     const pct = Math.round(r.diff * 100);
-    out.push(`Market: you give ${r.give.length > 1 ? fmt(rawValue(r.give)) + ' (worth ' + fmt(r.gv) + ' as a package)' : fmt(r.gv)} for ${fmt(r.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${-pct}% over market, paid by you`}).`);
+    const k = r.kc;
+    const adjTxt = k && (k.adjA > 1 || k.adjB > 1) ? `, plus KTC's value adjustment of ${fmt(Math.max(k.adjA, k.adjB))} to ${k.adjA > 1 ? 'your' : 'their'} side` : '';
+    out.push(`Market: you give ${fmt(k ? k.rawA : r.gv)} for ${fmt(k ? k.rawB : r.rv)}${adjTxt} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${-pct}% over market, paid by you`}).`);
     return out;
   }
 
@@ -1203,7 +1249,7 @@ const ENGINE = (() => {
   }
   const fmt = x => Math.round(x).toLocaleString('en-GB');
 
-  return { buildModel, applyValues, generateTrades, offersFor, asksFor, weeklyNeeds, evaluateIncoming, freeAgents, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
+  return { buildModel, applyValues, ktcCompare, generateTrades, offersFor, asksFor, weeklyNeeds, evaluateIncoming, freeAgents, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
 })();
 if (typeof module !== 'undefined') module.exports = ENGINE;
 /*ENGINE-END*/
@@ -1339,7 +1385,7 @@ function rebuild() {
 }
 const label = s => ({ winnow: 'Win now', middle: 'Middle', rebuild: 'Rebuild' }[s]);
 const stratPill = t => `<span class="pill ${t.strategy}">${label(t.strategy)}</span>`;
-const assetMeta = a => a.kind === 'pick' ? 'Draft pick' : `${a.pos} · ${a.team}${a.age ? ' · ' + Math.floor(a.age) : ''}`;
+const assetMeta = a => a.kind === 'pick' ? (a.equiv ? `Draft pick · valued as a ${a.equiv}` : 'Draft pick') : `${a.pos} · ${a.team}${a.age ? ' · ' + Math.floor(a.age) : ''}`;
 
 function renderTrades() {
   const trades = ENGINE.generateTrades(MODEL, P());
@@ -1424,7 +1470,7 @@ function renderEvaluate() {
   const col = { good: 'var(--good)', warn: 'var(--warn)', bad: 'var(--bad)' }[res.tone];
   const pct = Math.round(r.diff * 100);
   const why = [
-    `Market: you give ${fmt(r.gv)}, you get ${fmt(r.rv)} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${-pct}% their way`}).${res.proposing ? '' : ` They came to you, so aim for at least +${Math.round(res.premium * 100)}%.`}`,
+    `Market: you give ${fmt(r.kc.rawA)}, you get ${fmt(r.kc.rawB)}${r.kc.adjA > 1 || r.kc.adjB > 1 ? `, plus KTC's value adjustment of ${fmt(Math.max(r.kc.adjA, r.kc.adjB))} to ${r.kc.adjA > 1 ? 'your' : 'their'} side` : ''} (${pct === 0 ? 'even' : pct > 0 ? `+${pct}% your way` : `${-pct}% their way`}).${res.proposing ? '' : ` They came to you, so aim for at least +${Math.round(res.premium * 100)}%.`}`,
     ...(res.proposing ? [`Chance they accept: ${res.likely}. ${r.theirNow > 150 ? `Their lineup gets stronger by about ${fmt(r.theirNow)}. ` : r.theirNow < -150 ? `It weakens their lineup by about ${fmt(-r.theirNow)}. ` : ''}${r.theirFut > 0 ? 'They gain long-term value.' : 'They lose long-term value.'}`] : []),
     ...(r.cuffNotes?.length ? [`Handcuff: ${r.cuffNotes.join('; ')}.`] : []),
     ...(r.tendency?.length ? [`Their trade history: ${r.tendency.join('; ')}.`] : []),
@@ -1714,14 +1760,16 @@ function renderLeague() {
   const gradeOf = pct => pct >= 0.3 ? 'A+' : pct >= 0.15 ? 'A' : pct >= 0.05 ? 'B+' : pct > -0.05 ? 'B' : pct > -0.15 ? 'C' : pct > -0.3 ? 'D' : 'F';
   const gradeCol = g => g.startsWith('A') ? 'var(--good)' : g === 'B+' || g === 'B' ? 'var(--accent)' : g === 'C' ? 'var(--warn)' : 'var(--bad)';
   const record = new Map();
-  const thenVal = l => ENGINE.packageValue(l.map(a => ({ value: a.then ?? a.value })));
+  const thenL = l => l.map(a => ({ value: a.then ?? a.value }));
   for (const e of log) {
     for (const sd of e.sides) {
       // Hindsight (today's values)
-      const gotN = ENGINE.packageValue(sd.got), gaveN = ENGINE.packageValue(sd.gave);
+      const kN = ENGINE.ktcCompare(sd.gave, sd.got);
+      const gotN = sd.got.length && sd.gave.length ? kN.b : ENGINE.packageValue(sd.got), gaveN = sd.got.length && sd.gave.length ? kN.a : ENGINE.packageValue(sd.gave);
       sd.netNow = gotN - gaveN; sd.pctNow = sd.netNow / Math.max(gotN, gaveN, 1); sd.gradeNow = gradeOf(sd.pctNow);
       // At the time of the trade, when the daily history covers it
-      const got = e.atTime ? thenVal(sd.got) : gotN, gave = e.atTime ? thenVal(sd.gave) : gaveN;
+      const kT = e.atTime ? ENGINE.ktcCompare(thenL(sd.gave), thenL(sd.got)) : null;
+      const got = kT ? kT.b : gotN, gave = kT ? kT.a : gaveN;
       sd.net = got - gave; sd.pct = sd.net / Math.max(got, gave, 1); sd.grade = gradeOf(sd.pct);
       if (sd.team) { const r = record.get(sd.team) || { w: 0, l: 0, d: 0, net: 0 }; Math.abs(sd.pct) < 0.05 ? r.d++ : sd.net > 0 ? r.w++ : r.l++; r.net += sd.net; record.set(sd.team, r); }
     }
@@ -1736,7 +1784,7 @@ function renderLeague() {
   <p class="small">${log.length ? `From ${log.length} completed trade${log.length === 1 ? '' : 's'} (${seasons.join(', ')}). These tendencies feed into the trade scores, and managers who trade more often rank a little higher. Values are today's, so they show what kind of assets moved, not what they were worth at the time.` : 'No completed trades found in this league yet. Profiles will fill in as trades happen.'}</p>
   ${log.length ? `<div class="card">${MODEL.teams.slice().sort((a, b) => b.profile.trades - a.profile.trades).map(t => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(t.name)}</b>${t === MODEL.me ? ' <span class="tag buy">you</span>' : ''} <span class="small">· ${t.profile.trades} trade${t.profile.trades === 1 ? '' : 's'}${record.get(t) ? ` · record ${record.get(t).w}–${record.get(t).l}${record.get(t).d ? '–' + record.get(t).d : ''} · net ${record.get(t).net >= 0 ? '+' : ''}${fmt(record.get(t).net)}` : ''}</span><div>${t.profile.tags.map(g => `<span class="pill" style="margin:3px 4px 0 0">${esc(g)}</span>`).join('')}</div></div>`).join('')}</div>
   <h3 style="margin:18px 0 4px;font-size:16px">Recent trades</h3>
-  <p class="small">Graded on values from the day of the trade, for trades since the site started saving daily values (${esc((RAW.history?.dates || [])[0] || 'today')}). Older trades are graded on today's values, with hindsight. Each grade compares what a side got against what it gave, adjusted so a 2-for-1 is judged fairly. A+ means a clear win, B is about even, F is a fleecing. Record is wins–losses(–evens).</p>
+  <p class="small">Graded on values from the day of the trade, for trades since the site started saving daily values (${esc((RAW.history?.dates || [])[0] || 'today')}). Older trades are graded on today's values, with hindsight. Each grade compares what a side got against what it gave, using KTC's value adjustment so a 2-for-1 is judged the way KTC would. A+ means a clear win, B is about even, F is a fleecing. Record is wins–losses(–evens).</p>
   ${log.slice(0, 12).map(e => `<div class="card"><div class="trade-top"><span class="small">${e.when ? new Date(e.when).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : e.season}</span><span class="small" style="text-align:right"><b>${esc(e.verdict)}</b>${e.hindsight ? `<br>${esc(e.hindsight)}` : ''}</span></div>
     <div class="sides">${e.sides.map(sd => `<div class="side"><h4 style="display:flex;justify-content:space-between"><span>${esc(sd.teamName)} got</span><span style="font-size:18px;color:${gradeCol(sd.grade)};letter-spacing:0">${sd.grade}${e.atTime && sd.gradeNow !== sd.grade ? `<span class="small" style="font-size:11px;color:var(--muted)"> now ${sd.gradeNow}</span>` : ''}</span></h4>${sd.got.length ? sd.got.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}</div><div class="meta">${a.kind === 'pick' ? 'Draft pick' : esc(a.pos) + (a.age ? ' · ' + Math.floor(a.age) + ' then' : '')}</div></div><div class="val">${e.atTime && a.then != null ? `${fmt(a.then)}<div class="small">now ${fmt(a.value)}</div>` : fmt(a.value)}</div></div>`).join('') : '<div class="small">Nothing</div>'}</div>`).join('')}</div></div>`).join('')}` : ''}`;
   $('#tab-league').insertAdjacentHTML('beforeend', profHtml);
