@@ -360,6 +360,11 @@ const ENGINE = (() => {
   }
 
   function buildModel(input, prefs) {
+    const result = buildModelInner(input, prefs);
+    model_ref = result;
+    return result;
+  }
+  function buildModelInner(input, prefs) {
     const { league, users, rosters, tradedPicks = [], fc = [], sleeperPlayers = null, stats = null, trending = [], myUsername, history = null } = input;
     const hist = summariseHistory(history, prefs.dipWindow ?? 90);
     const slots = (league.roster_positions || []).filter(s => SKILL.includes(s) || FLEX_ELIG[s]);
@@ -528,6 +533,22 @@ const ENGINE = (() => {
       pool.slice().sort((a, b) => b.value - a.value).forEach((x, i) => { proj.get(x.id).valRankAll = i + 1; });
     }
     for (const p of players.values()) { const x = proj.get(p.id); if (x) { p.projRank = x.projRank; p.valRankAll = x.valRankAll; } }
+    // This-season value ("now") from projected points: per position, learn how market this-season value
+    // relates to projected points, then value each player 70% on his points, 30% on the market's view.
+    const pointsNow = {};
+    for (const pos of SKILL) {
+      const rows = [...players.values()].filter(p => p.pos === pos && p.projPpg != null && (p.gp || 0) >= 3 && p.now > 0);
+      if (rows.length < 12) continue;
+      const mx = rows.reduce((a, p) => a + p.projPpg, 0) / rows.length, my = rows.reduce((a, p) => a + p.now, 0) / rows.length;
+      let sxy = 0, sxx = 0; for (const p of rows) { sxy += (p.projPpg - mx) * (p.now - my); sxx += (p.projPpg - mx) ** 2; }
+      const b = sxx ? sxy / sxx : 0;
+      if (b > 0) pointsNow[pos] = { a: my - b * mx, b };
+    }
+    for (const p of players.values()) {
+      const f = pointsNow[p.pos];
+      p.nowMarket = p.now;
+      if (f && p.projPpg != null && (p.gp || 0) >= 2) p.now = 0.3 * p.now + 0.7 * Math.max(0, f.a + f.b * p.projPpg);
+    }
 
     // ---- Breakout signals (computed league-wide by position) ----
     const byPos = {};
@@ -1307,12 +1328,25 @@ const ENGINE = (() => {
     return out;
   }
 
+  // Projected weekly points of a team's best lineup
+  const lineupPts = list => lineupValue(list.filter(p => p.kind === 'player' && !p.onTaxi).map(p => Object.assign(Object.create(p), { pp: p.projPpg ?? p.ppg ?? 0 })), model_slots, 'pp').total;
+  let model_slots = [];
+  function pointsDelta(tr, model) {
+    model_slots = model.slots;
+    const t = tr.partner, gIds = new Set(tr.give.map(a => a.id)), rIds = new Set(tr.get.map(a => a.id));
+    const theirs = lineupPts(t.players.filter(p => !rIds.has(p.id)).concat(tr.give.filter(a => a.kind === 'player'))) - lineupPts(t.players);
+    const mine = lineupPts(model.me.players.filter(p => !gIds.has(p.id)).concat(tr.get.filter(a => a.kind === 'player'))) - lineupPts(model.me.players);
+    return { theirs, mine };
+  }
+
   // Plain-English reasons for a trade
   function explain(tr, model) {
     const why = [];
     const stratName = { winnow: 'win-now', middle: 'in the middle', rebuild: 'rebuilding' };
     const t = tr.partner;
-    if (tr.theirNow > 150) why.push(`${t.name} are ${stratName[t.strategy]} (${t.wins}–${t.losses}) and their best starting lineup gets stronger by about ${fmt(tr.theirNow)} points of value.`);
+    const pd = pointsDelta(tr, model);
+    if (tr.theirNow > 150 && pd.theirs > 0.5) why.push(`${t.name} are ${stratName[t.strategy]} (${t.wins}–${t.losses}), and their best lineup gains about ${pd.theirs.toFixed(1)} projected points a week.`);
+    else if (tr.theirNow > 150) why.push(`${t.name} are ${stratName[t.strategy]} (${t.wins}–${t.losses}) and their best starting lineup gets stronger.`);
     else if (tr.theirFut > 0) why.push(`${t.name} are ${stratName[t.strategy]} (${t.wins}–${t.losses}) and gain long-term value.`);
     for (const a of tr.get) why.push(`You get ${a.name}: ${assetReason(a)}`);
     for (const a of tr.give) if (a.kind === 'player') why.push(`You give ${a.name}: ${sellReason(a)}`);
@@ -1326,11 +1360,14 @@ const ENGINE = (() => {
     return why;
   }
   // Why the other manager might say yes (used by the offer builder)
-  function theirSideReasons(r) {
+  let model_ref = null;
+  function theirSideReasons(r, model) {
+    model_ref = model || model_ref;
     const t = r.partner, out = [];
     const slotName = s => ({ FLEX: 'flex', SUPER_FLEX: 'superflex', REC_FLEX: 'flex', WRRB_FLEX: 'flex' }[s] || s);
     if (r.newStarters?.length) out.push(r.newStarters.map(([s, p]) => `${p.name} would start for them at ${slotName(s)}`).join('; ') + '.');
-    if (t.strategy === 'winnow' && r.theirNow > 100) out.push(`They're playing to win now (${t.wins}–${t.losses}): this makes their best lineup stronger by about ${fmt(r.theirNow)}.`);
+    const pd = pointsDelta(r, model_ref);
+    if (t.strategy === 'winnow' && r.theirNow > 100) out.push(`They're playing to win now (${t.wins}–${t.losses}): their best lineup gains about ${pd.theirs.toFixed(1)} projected points a week.`);
     if (t.strategy !== 'winnow' && r.theirFut > 0) out.push(`They're ${t.strategy === 'rebuild' ? 'rebuilding' : 'in the middle'}, so they come out ahead on long-term value (younger pieces or picks).`);
     const pk = r.give.filter(a => a.kind === 'pick');
     if (pk.length && t.strategy !== 'winnow') out.push(`Includes ${pk.map(a => a.name).join(' and ')}, the kind of asset they're collecting.`);
