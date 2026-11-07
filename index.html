@@ -88,6 +88,7 @@
       <button data-tab="trades" class="on">Top trades</button>
       <button data-tab="week">This week</button>
       <button data-tab="targets">Targets</button>
+      <button data-tab="points">Points</button>
       <button data-tab="fa">Free agents</button>
       <button data-tab="myteam">My team</button>
       <button data-tab="league">League</button>
@@ -104,6 +105,7 @@
   <section id="tab-trades"></section>
   <section id="tab-week" class="hidden"></section>
   <section id="tab-targets" class="hidden"></section>
+  <section id="tab-points" class="hidden"></section>
   <section id="tab-fa" class="hidden"></section>
   <section id="tab-myteam" class="hidden"></section>
   <section id="tab-league" class="hidden"></section>
@@ -440,13 +442,100 @@ const ENGINE = (() => {
       }
     }
 
+    // ---- Points model: league-scoring points, usage-based expected points, projection ----
+    const sc = league.scoring_settings || {};
+    const recPts = sc.rec ?? 0.5, teBonus = sc.bonus_rec_te || 0;
+    const leaguePts = (st, pos) => ((recPts >= 1 ? st.pts_ppr : recPts >= 0.5 ? st.pts_half_ppr : st.pts_std) ?? st.pts_half_ppr ?? 0) + (pos === 'TE' ? teBonus * (st.rec || 0) : 0);
+    const posOfId = id => fcById.get(id)?.player.position || sleeperPlayers?.[id]?.position || players.get(id)?.pos;
+    const fullFeats = (pos, st) => {
+      const gp = Math.max(1, st.gp || 0), snap = st.tm_off_snp ? (st.off_snp || 0) / st.tm_off_snp : 0;
+      if (pos === 'QB') return [(st.pass_att || 0) / gp, (st.rush_att || 0) / gp, 1];
+      if (pos === 'RB') return [(st.rush_att || 0) / gp, (st.rec_tgt || 0) / gp, snap, 1];
+      return [(st.rec_tgt || 0) / gp, snap, 1];
+    };
+    // Fallback: one combined opportunity number per game
+    const simpleFeats = (pos, st) => {
+      const gp = Math.max(1, st.gp || 0);
+      if (pos === 'QB') return [((st.pass_att || 0) + 2 * (st.rush_att || 0)) / gp, 1];
+      if (pos === 'RB') return [((st.rush_att || 0) + 2 * (st.rec_tgt || 0)) / gp, 1];
+      return [(st.rec_tgt || 0) / gp, 1];
+    };
+    const featMode = {};
+    const feats = (pos, st) => (featMode[pos] === 'simple' ? simpleFeats : fullFeats)(pos, st);
+    // Weighted least squares per position: points per game ~ usage per game
+    const fit = {};
+    const statRows = {};
+    for (const [id, st] of statMap) {
+      const pos = posOfId(id);
+      if (!SKILL.includes(pos) || (st.gp || 0) < 3) continue;
+      (statRows[pos] ??= []).push({ x: feats(pos, st), y: leaguePts(st, pos) / st.gp, w: st.gp });
+    }
+    const solve = rows => {
+      const k = rows[0].x.length;
+      const A = Array.from({ length: k }, () => new Array(k + 1).fill(0));
+      for (const r of rows) for (let i = 0; i < k; i++) { for (let j = 0; j < k; j++) A[i][j] += r.w * r.x[i] * r.x[j]; A[i][k] += r.w * r.x[i] * r.y; }
+      for (let i = 0; i < k; i++) A[i][i] += 1e-6; // keep it solvable
+      for (let c = 0; c < k; c++) { // Gaussian elimination
+        let piv = c; for (let r = c + 1; r < k; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+        [A[c], A[piv]] = [A[piv], A[c]];
+        for (let r = 0; r < k; r++) if (r !== c) { const f = A[r][c] / A[c][c]; for (let j = c; j <= k; j++) A[r][j] -= f * A[c][j]; }
+      }
+      return A.map((row, i) => row[k] / row[i]);
+    };
+    for (const [pos, rows] of Object.entries(statRows)) {
+      if (rows.length < 15) continue;
+      let c = solve(rows);
+      // Usage should never lower expected points: if any usage weight is negative, use the simpler model
+      if (c.slice(0, -1).some(v => v < 0)) {
+        featMode[pos] = 'simple';
+        const st2 = [...statMap.entries()].filter(([id, st]) => posOfId(id) === pos && (st.gp || 0) >= 3);
+        c = solve(st2.map(([, st]) => ({ x: simpleFeats(pos, st), y: leaguePts(st, pos) / st.gp, w: st.gp })));
+      }
+      fit[pos] = c;
+    }
+    const xppgOf = (pos, st) => fit[pos] ? Math.max(0, feats(pos, st).reduce((s, v, i) => s + v * fit[pos][i], 0)) : null;
+    // Recent form in your league's own scoring (rostered players only)
+    const weekly = new Map();
+    for (const w of Object.keys(input.matchups || {}).map(Number).sort((a, b) => a - b))
+      for (const m of input.matchups[w] || []) for (const [id, pt] of Object.entries(m.players_points || {})) {
+        if (!weekly.has(id)) weekly.set(id, []);
+        weekly.get(id).push(pt);
+      }
+    const prevMap = normaliseStats(input.statsPrev);
+    const projOf = (id, pos) => {
+      const st = statMap.get(id);
+      const out = { prevPpg: null };
+      const pv = prevMap.get(id);
+      if (pv && (pv.gp || 0) >= 4) out.prevPpg = leaguePts(pv, pos) / pv.gp;
+      if (!st || (st.gp || 0) < 2) return out;
+      out.seasonPpg = leaguePts(st, pos) / st.gp;
+      out.xppg = xppgOf(pos, st);
+      const wk = (weekly.get(id) || []).filter(x => x !== 0).slice(-4);
+      out.last4 = wk.length >= 2 ? wk.reduce((a, b) => a + b, 0) / wk.length : null;
+      const x = out.xppg ?? out.seasonPpg;
+      out.projPpg = out.last4 != null ? 0.5 * x + 0.3 * out.seasonPpg + 0.2 * out.last4 : 0.6 * x + 0.4 * out.seasonPpg;
+      out.gp = st.gp;
+      return out;
+    };
+    const proj = new Map();
+    for (const [id] of statMap) { const pos = posOfId(id); if (SKILL.includes(pos)) proj.set(id, Object.assign(projOf(id, pos), { pos })); }
+    for (const p of players.values()) if (SKILL.includes(p.pos)) Object.assign(p, proj.get(p.id) || projOf(p.id, p.pos));
+    // League-wide ranks by position: projected points vs market value (for "undervalued producers")
+    for (const pos of SKILL) {
+      const pool = [...proj.entries()].filter(([id, x]) => x.pos === pos && x.projPpg != null && (x.gp || 0) >= 3)
+        .map(([id, x]) => ({ id, proj: x.projPpg, value: fcById.get(id)?.value ?? 0 }));
+      pool.slice().sort((a, b) => b.proj - a.proj).forEach((x, i) => { proj.get(x.id).projRank = i + 1; });
+      pool.slice().sort((a, b) => b.value - a.value).forEach((x, i) => { proj.get(x.id).valRankAll = i + 1; });
+    }
+    for (const p of players.values()) { const x = proj.get(p.id); if (x) { p.projRank = x.projRank; p.valRankAll = x.valRankAll; } }
+
     // ---- Breakout signals (computed league-wide by position) ----
     const byPos = {};
     for (const p of players.values()) if (SKILL.includes(p.pos)) (byPos[p.pos] ??= []).push(p);
     const haveStats = statMap.size > 0;
     for (const [pos, list] of Object.entries(byPos)) {
       const withGames = list.filter(p => p.stats && (p.stats.gp || 0) >= 3);
-      const ppg = p => (p.stats.pts_half_ppr ?? p.stats.pts_ppr ?? 0) / Math.max(1, p.stats.gp);
+      const ppg = p => leaguePts(p.stats, pos) / Math.max(1, p.stats.gp);
       const opp = p => {
         const s = p.stats, gp = Math.max(1, s.gp);
         if (pos === 'QB') return ((s.pass_att || 0) + 1.5 * (s.rush_att || 0)) / gp;
@@ -465,7 +554,7 @@ const ENGINE = (() => {
         if (haveStats && p.stats && (p.stats.gp || 0) >= 3) {
           const u = 0.65 * (oppPct.get(p.id) ?? 0) + 0.35 * (snapPct.get(p.id) ?? oppPct.get(p.id) ?? 0);
           sig.usage = u;
-          const gap = valRank.get(p.id) - ppgRank.get(p.id);
+          const gap = p.projRank && p.valRankAll ? p.valRankAll - p.projRank : valRank.get(p.id) - ppgRank.get(p.id);
           sig.underval = clamp(gap / 20);
           p.ppg = ppg(p); p.ppgRank = ppgRank.get(p.id); p.valRank = valRank.get(p.id);
           p.oppPerGame = opp(p); p.snapShare = snap(p);
@@ -584,7 +673,7 @@ const ENGINE = (() => {
     }
     const tradeLog = buildTendencies(input.tradeHistory, teams, { fcById, sleeperPlayers, pickValue, history: input.history });
     return { league, slots, season, teams, teamById, players, picks, me, haveStats, haveTrending: trendMap.size > 0, histSpan: hist?.span || 0, tradeLog,
-      fcById, sleeperPlayers, trendMap, statMap, maxTrend, rostered: new Set(teams.flatMap(t => t.playerIds)) };
+      fcById, sleeperPlayers, trendMap, statMap, maxTrend, rostered: new Set(teams.flatMap(t => t.playerIds)), proj, fit, featMode };
   }
 
   const STRAT_W = { winnow: { now: 1.0, fut: 0.25 }, middle: { now: 0.6, fut: 0.6 }, rebuild: { now: 0.12, fut: 1.0 } };
@@ -1085,7 +1174,7 @@ const ENGINE = (() => {
   function weeklyNeeds(model, prefs, byeTeams) {
     const bye = new Set(byeTeams || []);
     const why = p => bye.has(p.team) ? 'bye' : OUT_RE.test(p.injury || '') ? (p.injury || 'out') : null;
-    const wk = p => p.ppg != null ? p.ppg : p.now / 400; // weekly points proxy
+    const wk = p => p.projPpg ?? p.ppg ?? p.now / 400; // weekly points: projection where we have one
     const ctx = makeCtx(model, prefs);
     const me = model.me;
     const mine = myGivePool(model, prefs, { forOffer: true }).filter(a => a.kind === 'player' && !why(a));
@@ -1278,7 +1367,8 @@ const ENGINE = (() => {
     const bits = [];
     if (a.age) bits.push(`age ${Math.floor(a.age)}`);
     const s = a.signals || {};
-    if (a.ppgRank && a.valRank && a.valRank - a.ppgRank >= 5) bits.push(`scoring like ${a.pos}${a.ppgRank} but valued as ${a.pos}${a.valRank}`);
+    if (a.projRank && a.valRankAll && a.valRankAll - a.projRank >= 6) bits.push(`projected as ${a.pos}${a.projRank} on points (${a.projPpg.toFixed(1)} a game) but valued as ${a.pos}${a.valRankAll}`);
+    else if (a.ppgRank && a.valRank && a.valRank - a.ppgRank >= 5) bits.push(`scoring like ${a.pos}${a.ppgRank} but valued as ${a.pos}${a.valRank}`);
     if (s.usage >= 0.75) bits.push(`top-tier usage among ${a.pos}s${a.snapShare ? ` (${Math.round(a.snapShare * 100)}% snaps)` : ''}`);
     if (a.adds >= 1000) bits.push(`trending on Sleeper (${fmt(a.adds)} adds in 72h)`);
     if (a.expert && a.expert.up > a.expert.down) bits.push(`tipped to rise in ${a.expert.sources.length} expert source${a.expert.sources.length === 1 ? '' : 's'}`);
@@ -1417,7 +1507,7 @@ async function load(force) {
     status('Loading player details, season stats and trade history…');
     RAW_ROSTERS = rosters.map(r => ({ roster_id: r.roster_id, owner_id: r.owner_id }));
     const season = nfl?.season || league.season;
-    const [sleeperPlayers, stats, history, weekInfo, ktc, experts, historyKtc, tradeHistory, matchups] = await Promise.all([
+    const [sleeperPlayers, stats, history, weekInfo, ktc, experts, historyKtc, tradeHistory, matchups, statsPrev] = await Promise.all([
       soft(force ? getJSON(`${SLEEPER}/players/nfl`) : cached('players', 86400000, () => getJSON(`${SLEEPER}/players/nfl`))),
       soft(getJSON(`${SLEEPER}/stats/nfl/regular/${season}`).catch(() => getJSON(`https://api.sleeper.com/stats/nfl/${season}?season_type=regular`))),
       soft(fetch('data/history.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
@@ -1427,8 +1517,9 @@ async function load(force) {
       soft(fetch('data/history-ktc.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(loadTradeHistory(league, nfl?.week)),
       soft(loadMatchups(league)),
+      soft(cached(`stats:${+season - 1}`, 30 * 86400000, () => getJSON(`${SLEEPER}/stats/nfl/regular/${+season - 1}`))),
     ]);
-    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc, experts, matchups };
+    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc, experts, matchups, statsPrev };
     rebuild();
     const missing = [!tradeHistory && 'trade history', !stats && 'season stats', !trending && 'trending adds', !sleeperPlayers && 'player details'].filter(Boolean);
     status(`Updated ${new Date().toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` + (missing.length ? ` · couldn't load ${missing.join(', ')}, so those signals are skipped` : ''));
@@ -1447,11 +1538,11 @@ function rebuild() {
   CARDS.length = 0;
   $('#title').textContent = RAW.league.name;
   $('#subtitle').textContent = `${MODEL.me.name} · ${MODEL.me.wins}–${MODEL.me.losses} · strategy: ${label(MODEL.me.strategy)}${RAW.week ? ` · week ${RAW.week}` : ''}`;
-  renderTrades(); renderWeek(); renderTargets(); renderFA(); renderMyTeam(); renderLeague(); renderEvaluate(); renderOffers(); renderSettings();
+  renderTrades(); renderWeek(); renderTargets(); renderPoints(); renderFA(); renderMyTeam(); renderLeague(); renderEvaluate(); renderOffers(); renderSettings();
 }
 const label = s => ({ winnow: 'Win now', middle: 'Middle', rebuild: 'Rebuild' }[s]);
 const stratPill = t => `<span class="pill ${t.strategy}">${label(t.strategy)}</span>`;
-const assetMeta = a => a.kind === 'pick' ? (a.equiv ? `Draft pick · valued as a ${a.equiv}` : 'Draft pick') : `${a.pos} · ${a.team}${a.age ? ' · ' + Math.floor(a.age) : ''}`;
+const assetMeta = a => a.kind === 'pick' ? (a.equiv ? `Draft pick · valued as a ${a.equiv}` : 'Draft pick') : `${a.pos} · ${a.team}${a.age ? ' · ' + Math.floor(a.age) : ''}${a.projPpg != null ? ` · ${a.projPpg.toFixed(1)} pts/g` : ''}`;
 
 function renderTrades() {
   const trades = ENGINE.generateTrades(MODEL, P());
@@ -1499,7 +1590,7 @@ function expertSection() {
 
 // ---------- Weekly strategy brief ----------
 function weeklyPpg(players) {
-  return ENGINE.lineupValue(players.filter(p => !p.onTaxi && p.pos).map(p => Object.assign(Object.create(p), { wk: p.ppg || 0 })), MODEL.slots, 'wk').total;
+  return ENGINE.lineupValue(players.filter(p => !p.onTaxi && p.pos).map(p => Object.assign(Object.create(p), { wk: p.projPpg ?? p.ppg ?? 0 })), MODEL.slots, 'wk').total;
 }
 function strategyBrief(needs) {
   const reg = (RAW.league.settings?.playoff_week_start || 15) - 1;
@@ -1677,6 +1768,34 @@ function renderEvaluate() {
     saveInterest(); LEARN = ENGINE.learnFromOffers(OFFERS, INTEREST); renderOffers();
     $('#ev-log').outerHTML = '<span class="pill" style="color:var(--good)">Interest logged</span>';
   };
+}
+
+let PTS_POS = 'ALL', PTS_YOUNG = false;
+function renderPoints() {
+  const el = $('#tab-points');
+  const M = MODEL, sp = RAW.sleeperPlayers || {};
+  if (!M.proj?.size) { el.innerHTML = '<div class="card small">Season stats from Sleeper are needed for the points model.</div>'; return; }
+  const owner = id => { const p = M.players.get(id); return p ? M.teamById.get(p.owner) : null; };
+  const rows = [...M.proj.entries()].filter(([id, x]) => x.projPpg != null && (x.gp || 0) >= 3 && x.projRank && x.valRankAll && (sp[id]?.team || M.players.has(id)))
+    .map(([id, x]) => {
+      const p = M.players.get(id), f = M.fcById.get(id);
+      const age = p?.age ?? f?.player.maybeAge ?? sp[id]?.age ?? null;
+      return { id, x, p, name: p?.name || f?.player.name || sp[id]?.full_name || id, pos: x.pos, team: p?.team || sp[id]?.team || '', age, value: p?.value ?? f?.value ?? 0, t: owner(id), gap: x.valRankAll - x.projRank };
+    })
+    .filter(r => (PTS_POS === 'ALL' || r.pos === PTS_POS) && (!PTS_YOUNG || (r.age ?? 99) <= 25) && r.t !== M.me)
+    .filter(r => r.gap >= 6 && r.x.projPpg >= 7)
+    .sort((a, b) => (b.gap * Math.sqrt(b.x.projPpg)) - (a.gap * Math.sqrt(a.x.projPpg))).slice(0, 30);
+  el.innerHTML = `<p class="small"><b>Undervalued producers:</b> players whose projected points rank at their position is well above their trade-value rank. Projections blend <b>expected points from usage</b> (what their targets, carries, pass attempts and snap share are normally worth in your scoring; half-PPR, TE premium), their season average, and their last 4 weeks in your league. A big gap between expected and actual points means luck that may not last. Tap a rostered player for offers.</p>
+    <div class="row" style="margin:6px 0 4px">${['ALL', 'QB', 'RB', 'WR', 'TE'].map(p => `<button class="chip ${PTS_POS === p ? 'on' : ''}" data-pos="${p}">${p === 'ALL' ? 'All' : p}</button>`).join('')}<button class="chip ${PTS_YOUNG ? 'on' : ''}" id="pts-young">25 and under</button></div>
+    ${rows.length ? `<div class="card scroll"><table><thead><tr><th>Player</th><th class="n">Proj</th><th class="n">Usage</th><th class="n">Season</th><th class="n">Last 4</th><th class="n">'${String(+RAW.league.season - 1).slice(2)}</th><th class="n">Value</th></tr></thead><tbody>
+    ${rows.map(r => { const x = r.x; const luck = x.xppg != null ? x.seasonPpg - x.xppg : 0;
+      return `<tr class="${r.t ? 'tap' : ''}" data-id="${esc(r.id)}"><td><b>${esc(r.name)}</b><div class="small">${esc(r.pos)} · ${esc(r.team)}${r.age ? ' · ' + Math.floor(r.age) : ''} · ${r.t ? esc(r.t.name) : '<span style="color:var(--good)">free agent</span>'}</div>
+        <div class="small">Points ${r.pos}${x.projRank}, value ${r.pos}${x.valRankAll}${Math.abs(luck) >= 2 ? ` · ${luck > 0 ? `scoring ${luck.toFixed(1)} above his usage (may cool)` : `scoring ${(-luck).toFixed(1)} below his usage (due a bounce)`}` : ''}</div></td>
+        <td class="n"><b>${x.projPpg.toFixed(1)}</b></td><td class="n">${x.xppg != null ? x.xppg.toFixed(1) : '–'}</td><td class="n">${x.seasonPpg.toFixed(1)}</td><td class="n">${x.last4 != null ? x.last4.toFixed(1) : '–'}</td><td class="n">${x.prevPpg != null ? x.prevPpg.toFixed(1) : '–'}</td><td class="n">${fmt(r.value)}</td></tr>`; }).join('')}
+    </tbody></table><p class="small">Points per game in your league's scoring. "Usage" is what his workload would normally score. "'${String(+RAW.league.season - 1).slice(2)}" is last season.</p></div>` : '<div class="card small">No players with a big points-versus-value gap for this filter.</div>'}`;
+  el.querySelectorAll('button[data-pos]').forEach(b => b.onclick = () => { PTS_POS = b.dataset.pos; renderPoints(); });
+  $('#pts-young').onclick = () => { PTS_YOUNG = !PTS_YOUNG; renderPoints(); };
+  el.querySelectorAll('tr.tap').forEach(tr => tr.onclick = () => toggleOffers(tr));
 }
 
 function renderFA() {
@@ -1875,7 +1994,7 @@ function toggleInterest(btn) {
   const a = MODEL.me.assets.find(x => x.id === id);
   const others = MODEL.teams.filter(t => t !== MODEL.me).sort((x, y) => x.name.localeCompare(y.name));
   const row = document.createElement('tr'); row.className = 'offer-row';
-  row.innerHTML = `<td colspan="4" style="background:var(--bg)"><div class="card" style="margin:8px 0">
+  row.innerHTML = `<td colspan="5" style="background:var(--bg)"><div class="card" style="margin:8px 0">
     <div class="small" style="margin-bottom:6px">Who asked about <b>${esc(a.name)}</b>, or sent you an offer for him?</div>
     <div class="row"><select class="int-team"><option value="">Choose a team…</option>${others.map(t => `<option value="${t.rosterId}">${esc(t.name)} (${label(t.strategy)})</option>`).join('')}</select></div>
     <div class="int-out" style="margin-top:8px"></div></div></td>`;
@@ -1929,10 +2048,10 @@ function renderMyTeam() {
     return t;
   };
   $('#tab-myteam').innerHTML = `<p class="small"><b>Protect</b> keeps a player out of every trade, and <b>Shop</b> forces him into the trade search. <b>Auto</b> lets the site decide: it shops players near their value peak who are past their age peak or whose value is mostly about this season. It won't sell anyone whose value is falling. "Dip · hold" marks a player whose value has dropped while his role hasn't, which is a bad time to sell.</p>
-  <div class="card scroll"><table><thead><tr><th>Asset</th><th class="n">Value</th><th class="n">2-yr</th><th>Trade?</th></tr></thead><tbody>
+  <div class="card scroll"><table><thead><tr><th>Asset</th><th class="n">Pts</th><th class="n">Value</th><th class="n">2-yr</th><th>Trade?</th></tr></thead><tbody>
   ${rows.map(a => `<tr><td><b>${esc(a.name)}</b>${tags(a)}<div class="small">${esc(assetMeta(a))}${a.injury ? ' · ' + esc(a.injury) : ''}</div></td>
-  <td class="n">${fmt(a.value)}</td><td class="n" style="color:${a.ageMult >= 1 ? 'var(--good)' : a.ageMult < 0.8 ? 'var(--bad)' : 'var(--muted)'}">${fmt(a.future)}</td><td>${markBtns(a)}<div style="margin-top:4px"><button class="btn ghost interest" data-id="${esc(a.id)}" style="padding:2px 8px;font-size:12px">Interest?${INTEREST.some(i => i.playerId === a.id) ? ` (${INTEREST.filter(i => i.playerId === a.id).length})` : ''}</button></div></td></tr>`).join('')}
-  </tbody></table><p class="small">"2-yr" is the value we expect him to have in about two years, based on his age and position.</p></div>`;
+  <td class="n">${a.projPpg != null ? `<b>${a.projPpg.toFixed(1)}</b><div class="small">${a.seasonPpg != null ? a.seasonPpg.toFixed(1) + ' avg' : ''}</div>` : '–'}</td><td class="n">${fmt(a.value)}</td><td class="n" style="color:${a.ageMult >= 1 ? 'var(--good)' : a.ageMult < 0.8 ? 'var(--bad)' : 'var(--muted)'}">${fmt(a.future)}</td><td>${markBtns(a)}<div style="margin-top:4px"><button class="btn ghost interest" data-id="${esc(a.id)}" style="padding:2px 8px;font-size:12px">Interest?${INTEREST.some(i => i.playerId === a.id) ? ` (${INTEREST.filter(i => i.playerId === a.id).length})` : ''}</button></div></td></tr>`).join('')}
+  </tbody></table><p class="small">"Pts" is projected points per game (bold), with his season average under it. "2-yr" is the value we expect him to have in about two years, based on his age and position.</p></div>`;
   $('#tab-myteam').querySelectorAll('button.interest').forEach(b => b.onclick = () => toggleInterest(b));
   $('#tab-myteam').querySelectorAll('.seg button').forEach(b => b.onclick = () => {
     const id = b.parentElement.dataset.id; const m = b.dataset.m;
