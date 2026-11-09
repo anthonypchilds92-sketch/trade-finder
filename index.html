@@ -1519,8 +1519,8 @@ async function loadMatchups(league) {
   const out = {};
   await Promise.all(weeks.map(async w => {
     const done = w < last;
-    const load = () => getJSON(`${SLEEPER}/league/${LEAGUE_ID}/matchups/${w}`).then(ms => ms.map(m => ({ roster_id: m.roster_id, players: m.players, players_points: m.players_points })));
-    out[w] = await (done ? cached(`mu:${league.season}:${w}`, 365 * 86400000, load) : load()).catch(() => null);
+    const load = () => getJSON(`${SLEEPER}/league/${LEAGUE_ID}/matchups/${w}`).then(ms => ms.map(m => ({ roster_id: m.roster_id, matchup_id: m.matchup_id, points: m.points, starters: m.starters, players: m.players, players_points: m.players_points })));
+    out[w] = await (done ? cached(`mu2:${league.season}:${w}`, 365 * 86400000, load) : load()).catch(() => null);
   }));
   return out;
 }
@@ -1623,6 +1623,81 @@ function expertSection() {
   <p class="small">Players that recent articles (last ${X.days} days) tip to rise: mentioned alongside words like buy, stash, breakout or sleeper, minus mentions alongside sell, fade or bust. Read from ${ok.length ? esc(ok.join(', ')) : 'fantasy sites'}, updated ${new Date(X.generatedAt).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' })}. "Value hasn't moved" means the market hasn't caught up yet. Tap a player on another team for offers.</p>
   ${risers.length ? `<div class="card scroll"><table><tbody>${risers.map(line).join('')}</tbody></table></div>` : '<div class="card small">No clear risers in recent articles.</div>'}
   ${cooling.length ? `<h3 style="margin:14px 0 4px;font-size:15px">Experts cooling on your players</h3><p class="small">More negative than positive mentions recently. Consider selling before the market follows.</p><div class="card scroll"><table><tbody>${cooling.map(line).join('')}</tbody></table></div>` : ''}`;
+}
+
+// ---------- Week review: season, last week, performers, verdict ----------
+function weekReview() {
+  const MU = RAW.matchups; if (!MU) return '';
+  const weeks = Object.keys(MU).filter(w => MU[w]?.length && MU[w].some(m => m.points)).map(Number).sort((a, b) => a - b);
+  if (!weeks.length) return '';
+  const W = weeks[weeks.length - 1];
+  const me = MODEL.me, rid = me.rosterId;
+  const mine = MU[W].find(m => m.roster_id === rid); if (!mine) return '';
+  const opp = MU[W].find(m => m.matchup_id === mine.matchup_id && m.roster_id !== rid);
+  const oppT = opp ? MODEL.teamById.get(opp.roster_id) : null;
+  const reg = (RAW.league.settings?.playoff_week_start || 15) - 1;
+  const D = ENGINE.draftOrder(MODEL, MU, reg);
+  const dme = D.rows.find(r => r.team === me);
+  const wkMax = dme?.byWeek?.[weeks.indexOf(W)] ?? null;
+  // Season context
+  const pfRank = MODEL.teams.slice().sort((a, b) => b.pf - a.pf).indexOf(me) + 1;
+  const avgAll = MODEL.teams.reduce((s, t) => s + t.pf, 0) / MODEL.teams.length / Math.max(1, me.games);
+  const myAvg = me.pf / Math.max(1, me.games);
+  const recent = weeks.slice(-3).map(w => MU[w].find(m => m.roster_id === rid)?.points || 0);
+  const early = weeks.slice(0, Math.max(1, weeks.length - 3)).map(w => MU[w].find(m => m.roster_id === rid)?.points || 0);
+  const rAvg = recent.reduce((a, b) => a + b, 0) / recent.length, eAvg = early.reduce((a, b) => a + b, 0) / early.length;
+  const formTxt = rAvg > eAvg + 8 ? `scoring is up lately (${rAvg.toFixed(1)} a week over the last 3, against ${eAvg.toFixed(1)} before)` : rAvg < eAvg - 8 ? `scoring has dipped lately (${rAvg.toFixed(1)} a week over the last 3, against ${eAvg.toFixed(1)} before)` : `scoring is steady at about ${rAvg.toFixed(1)} a week`;
+  // Last week's players: against their projection
+  const pts = mine.players_points || {};
+  const starters = new Set(mine.starters || []);
+  const perf = me.players.filter(p => pts[p.id] != null && (p.projPpg ?? p.seasonPpg) != null).map(p => ({ p, pts: pts[p.id], exp: p.projPpg ?? p.seasonPpg, started: starters.has(p.id) }))
+    .map(x => Object.assign(x, { diff: x.pts - x.exp }));
+  const stars = perf.filter(x => x.pts >= 12 && x.diff >= 5).sort((a, b) => b.diff - a.diff).slice(0, 3);
+  const flops = perf.filter(x => x.exp >= 8 && x.diff <= -5).sort((a, b) => a.diff - b.diff).slice(0, 3);
+  const movers = me.players.filter(p => p.value >= 800 && p.trend).sort((a, b) => Math.abs(b.trend) - Math.abs(a.trend)).slice(0, 4);
+  // Verdict
+  const goal = Object.assign({ mode: 'above' }, prefs.draftGoal || {});
+  const others = D.rows.filter(r => r !== dme);
+  const tgt = goal.mode === 'above' ? (others.find(r => String(r.team.rosterId) === String(goal.rid)) || others[0]) : others[0];
+  const left = Math.max(0, reg - D.played);
+  const projMargin = dme && tgt ? dme.maxPF - tgt.maxPF + (dme.recentAvg - tgt.recentAvg) * left : 0;
+  const needPoints = goal.mode === 'above' && left > 0 && projMargin < 8 * left;
+  const canSell = goal.mode !== 'above' || left === 0 || projMargin >= 8 * left;
+  const sellHigh = me.players.filter(p => (p.sell >= 0.35 || p.ageMult < 0.9) && !p.dip && pts[p.id] != null && pts[p.id] >= Math.max(15, 1.5 * (p.projPpg ?? p.seasonPpg ?? 99)));
+  const others2 = [...MODEL.players.values()].filter(p => p.owner !== rid);
+  const longDips = others2.filter(p => p.buyLow && (p.dipFatigue ?? 0) >= 0.4).length;
+  const freshTips = (RAW.experts?.players || []).filter(e => { const p = MODEL.players.get(String(e.id)); return p && p.owner !== rid && e.up > e.down && Math.abs(p.trend / Math.max(1, p.value)) < 0.03 && (p.ageMult >= 1 || p.taxiNext); }).length;
+  const taxiShort = me.players.filter(p => p.taxiNext && p.value >= 800).length < (prefs.taxiGoal ?? 4);
+  let verdict, vcol; const vwhy = [];
+  if (canSell && sellHigh.length) {
+    verdict = 'Sell'; vcol = 'var(--warn)';
+    vwhy.push(`${sellHigh.map(p => `${esc(p.name)} (${pts[p.id].toFixed(1)} pts)`).join(', ')} just had a big week and ${sellHigh.length > 1 ? 'are' : 'is'} past ${sellHigh.length > 1 ? 'their' : 'his'} age peak. His value won't be higher than right after a week like that.`);
+  } else if (needPoints) {
+    verdict = 'Add points'; vcol = 'var(--bad)';
+    vwhy.push(`You need more max PF to stay above ${esc(tgt.team.name)}. Hold your scorers and add cheap points (waivers, or producers whose value lags their points). Don't sell yet.`);
+    if (sellHigh.length) vwhy.push(`${sellHigh.map(p => esc(p.name)).join(', ')} had a big week, but selling now would cost you max PF. Sell after week ${reg}.`);
+  } else if (longDips || freshTips || taxiShort) {
+    verdict = 'Buy'; vcol = 'var(--good)';
+    if (longDips) vwhy.push(`${longDips} buy-low player${longDips === 1 ? ' has' : 's have'} been in a long dip, so their managers may be ready to sell.`);
+    if (freshTips) vwhy.push(`${freshTips} young player${freshTips === 1 ? ' is' : 's are'} being tipped by experts but ${freshTips === 1 ? "hasn't" : "haven't"} risen in value yet.`);
+    if (taxiShort) vwhy.push('You still want another rookie you can stash on next year\'s taxi squad.');
+  } else {
+    verdict = 'Hold'; vcol = 'var(--accent)';
+    vwhy.push('No clear edges this week: no big sell-high moments, and nothing on sale that fits the rebuild. Keep monitoring rather than forcing a deal.');
+  }
+  if (needPoints && canSell === false && verdict !== 'Add points') vwhy.push(`Keep an eye on your max PF gap to ${esc(tgt.team.name)}.`);
+  const res = opp ? (mine.points > opp.points ? 'Won' : mine.points < opp.points ? 'Lost' : 'Tied') : null;
+  const benchLeft = wkMax != null ? wkMax - (mine.points || 0) : null;
+  const pl = x => `<b>${esc(x.p.name)}</b> ${x.pts.toFixed(1)} <span class="small">(expected ${x.exp.toFixed(1)}${x.started ? '' : ', on your bench'})</span>`;
+  return `<div class="card"><b style="font-size:16px">Week ${W} review</b>
+    <p style="margin:8px 0 4px"><b>Season so far:</b> ${me.wins}–${me.losses}${me.ties ? '–' + me.ties : ''}, ${pfRank}${['th', 'st', 'nd', 'rd'][pfRank % 10 > 3 || [11, 12, 13].includes(pfRank % 100) ? 0 : pfRank % 10]} in points scored (${myAvg.toFixed(1)} a week against a league average of ${avgAll.toFixed(1)}). Your ${formTxt}.${dme ? ` On max PF you're at pick ${dme.slot}${tgt && goal.mode === 'above' ? `, ${(dme.maxPF - tgt.maxPF) >= 0 ? (dme.maxPF - tgt.maxPF).toFixed(1) + ' above' : (tgt.maxPF - dme.maxPF).toFixed(1) + ' behind'} ${esc(tgt.team.name)}` : ''}.` : ''}</p>
+    ${res ? `<p style="margin:4px 0"><b>Last week:</b> ${res} ${(mine.points || 0).toFixed(1)}–${(opp.points || 0).toFixed(1)} against ${esc(oppT?.name || 'your opponent')}.${benchLeft != null && benchLeft > 0.5 ? ` Your best possible lineup would have scored ${wkMax.toFixed(1)}. That's ${benchLeft.toFixed(1)} left on the bench, which still counts towards max PF.` : ''}</p>` : ''}
+    ${stars.length ? `<p style="margin:4px 0"><b>Stood out:</b> ${stars.map(pl).join('; ')}.</p>` : ''}
+    ${flops.length ? `<p style="margin:4px 0"><b>Disappointed:</b> ${flops.map(pl).join('; ')}.</p>` : ''}
+    ${movers.length ? `<p style="margin:4px 0"><b>Value movers (30 days):</b> ${movers.map(p => `${esc(p.name)} <span style="color:${p.trend > 0 ? 'var(--good)' : 'var(--bad)'}">${p.trend > 0 ? '+' : ''}${fmt(p.trend)}</span>`).join(', ')}.</p>` : ''}
+    <div style="margin-top:10px;padding:10px;border-radius:10px;background:var(--panel2);border-left:4px solid ${vcol}"><div><span class="small">THIS WEEK</span> <b style="font-size:18px;color:${vcol}">${verdict}</b></div>
+      <ul class="why" style="margin-top:4px">${vwhy.map(w => `<li>${w}</li>`).join('')}</ul>
+      <div class="small">The specific moves are in the strategy brief below.</div></div></div>`;
 }
 
 // ---------- Weekly strategy brief ----------
@@ -1729,7 +1804,7 @@ function renderWeek() {
   const newST = wi ? others.filter(p => p.injStash && !prevST.has(p.id)) : [];
   const owner = id => MODEL.teamById.get(id)?.name || '';
   const mini = list => list.map(p => `<tr class="tap" data-id="${esc(p.id)}"><td><b>${esc(p.name)}</b><div class="small">${esc(assetMeta(p))}</div></td><td class="small">${esc(owner(p.owner))}</td><td class="n">${fmt(p.value)}${p.buyLow ? `<div class="small" style="color:var(--bad)">−${Math.round(p.dropPct * 100)}%</div>` : `<div class="small">${esc(p.injury || '')}</div>`}</td></tr>`).join('');
-  el.innerHTML = strategyBrief(needs) + `<p class="small">Week ${RAW.week || '?'}. ${byes ? `Teams on bye: ${byes.length ? byes.join(', ') : 'none'}.` : "Bye weeks load from the weekly round-up (every Tuesday), so for now only injuries are counted."} Worked out live from today's injuries and your settings.</p>
+  el.innerHTML = weekReview() + strategyBrief(needs) + `<p class="small">Week ${RAW.week || '?'}. ${byes ? `Teams on bye: ${byes.length ? byes.join(', ') : 'none'}.` : "Bye weeks load from the weekly round-up (every Tuesday), so for now only injuries are counted."} Worked out live from today's injuries and your settings.</p>
   <h3 style="margin:14px 0 4px;font-size:16px">Teams short this week</h3>
   <p class="small">Win-now and middle teams whose starting lineup has a hole this week, measured in points per game. A manager chasing a win may pay more than usual to fill it.</p>
   ${needs.length ? needs.map(n => {
