@@ -1723,7 +1723,20 @@ function weekReview() {
   // Last week's players: against their projection
   const pts = mine.players_points || {};
   const starters = new Set(mine.starters || []);
-  const perf = me.players.filter(p => pts[p.id] != null && (p.projPpg ?? p.seasonPpg) != null).map(p => ({ p, pts: pts[p.id], exp: p.projPpg ?? p.seasonPpg, started: starters.has(p.id) }))
+  // Which NFL teams actually played in week W: any player from that team scored (or lost) points
+  const spl = RAW.sleeperPlayers || {};
+  const nflTeam = id => MODEL.players.get(id)?.team || spl[id]?.team || null;
+  const played = new Set();
+  for (const m of MU[W]) for (const [id, pt] of Object.entries(m.players_points || {})) if (pt !== 0) { const t = nflTeam(id); if (t) played.add(t); }
+  const onBye = [], missed = [];
+  const perf = me.players.filter(p => pts[p.id] != null && (p.projPpg ?? p.seasonPpg) != null)
+    .filter(p => {
+      if (pts[p.id] !== 0) return true;
+      if (p.team && p.team !== 'FA' && !played.has(p.team)) { onBye.push(p); return false; } // bye week: nothing was expected
+      if (/^(IR|PUP|OUT|DOUBTFUL|SUS|NFI)/i.test(p.injury || '')) { missed.push(p); return false; } // didn't play
+      return true;
+    })
+    .map(p => ({ p, pts: pts[p.id], exp: p.projPpg ?? p.seasonPpg, started: starters.has(p.id) }))
     .map(x => Object.assign(x, { diff: x.pts - x.exp }));
   const stars = perf.filter(x => x.pts >= 12 && x.diff >= 5).sort((a, b) => b.diff - a.diff).slice(0, 3);
   const flops = perf.filter(x => x.exp >= 8 && x.diff <= -5).sort((a, b) => a.diff - b.diff).slice(0, 3);
@@ -1767,6 +1780,7 @@ function weekReview() {
     ${res ? `<p style="margin:4px 0"><b>Last week:</b> ${res} ${(mine.points || 0).toFixed(1)}–${(opp.points || 0).toFixed(1)} against ${esc(oppT?.name || 'your opponent')}.${benchLeft != null && benchLeft > 0.5 ? ` Your best possible lineup would have scored ${wkMax.toFixed(1)}. That's ${benchLeft.toFixed(1)} left on the bench, which still counts towards max PF.` : ''}</p>` : ''}
     ${stars.length ? `<p style="margin:4px 0"><b>Stood out:</b> ${stars.map(pl).join('; ')}.</p>` : ''}
     ${flops.length ? `<p style="margin:4px 0"><b>Disappointed:</b> ${flops.map(pl).join('; ')}.</p>` : ''}
+    ${onBye.filter(p => (p.projPpg ?? 0) >= 6).length ? `<p style="margin:4px 0" class="small">On bye: ${onBye.filter(p => (p.projPpg ?? 0) >= 6).map(p => esc(p.name)).join(', ')}.${missed.filter(p => (p.projPpg ?? 0) >= 6).length ? ' Missed through injury: ' + missed.filter(p => (p.projPpg ?? 0) >= 6).map(p => esc(p.name)).join(', ') + '.' : ''}</p>` : missed.filter(p => (p.projPpg ?? 0) >= 6).length ? `<p style="margin:4px 0" class="small">Missed through injury: ${missed.filter(p => (p.projPpg ?? 0) >= 6).map(p => esc(p.name)).join(', ')}.</p>` : ''}
     ${movers.length && MODEL.trendLabel !== null ? `<p style="margin:4px 0"><b>Value movers (${esc((MODEL.trendLabel || 'in 30 days').replace(/^in /, ''))}):</b> ${movers.map(p => `${esc(p.name)} <span style="color:${p.trend > 0 ? 'var(--good)' : 'var(--bad)'}">${p.trend > 0 ? '+' : ''}${fmt(p.trend)}</span>`).join(', ')}.</p>` : ''}
     <div style="margin-top:10px;padding:10px;border-radius:10px;background:var(--panel2);border-left:4px solid ${vcol}"><div><span class="small">THIS WEEK</span> <b style="font-size:18px;color:${vcol}">${verdict}</b></div>
       <ul class="why" style="margin-top:4px">${vwhy.map(w => `<li>${w}</li>`).join('')}</ul>
