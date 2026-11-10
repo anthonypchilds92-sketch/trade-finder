@@ -506,12 +506,14 @@ const ENGINE = (() => {
         if (!weekly.has(id)) weekly.set(id, []);
         weekly.get(id).push(pt);
       }
-    const prevMap = normaliseStats(input.statsPrev);
+    const prevMap = normaliseStats(input.statsPrev), prev2Map = normaliseStats(input.statsPrev2);
     const projOf = (id, pos) => {
       const st = statMap.get(id);
       const out = { prevPpg: null };
       const pv = prevMap.get(id);
       if (pv && (pv.gp || 0) >= 4) out.prevPpg = leaguePts(pv, pos) / pv.gp;
+      const pv2 = prev2Map.get(id);
+      if (pv2 && (pv2.gp || 0) >= 4) out.prev2Ppg = leaguePts(pv2, pos) / pv2.gp;
       if (!st || (st.gp || 0) < 2) return out;
       out.seasonPpg = leaguePts(st, pos) / st.gp;
       out.xppg = xppgOf(pos, st);
@@ -571,8 +573,13 @@ const ENGINE = (() => {
     for (const p of players.values()) {
       const x = proj.get(p.id), c = fairFit[p.pos];
       if (!c || !x || !established(p.id, x)) continue;
-      p.fairValue = Math.exp(c[0] * x.projPpg + c[1] * ageMult(p.pos, p.age) + c[2]);
+      const fairAt = ppg => Math.exp(c[0] * ppg + c[1] * ageMult(p.pos, p.age) + c[2]);
+      p.fairValue = fairAt(x.projPpg);
       p.valueGap = (p.value - p.fairValue) / p.fairValue; // + overvalued, − undervalued
+      // Proven production: his best season of the last three (older seasons count a little less)
+      const best = Math.max(x.projPpg, (x.prevPpg ?? 0) * 0.95, (x.prev2Ppg ?? 0) * 0.9);
+      p.provenPpg = best;
+      p.ceilGap = (p.value - fairAt(best)) / fairAt(best);
     }
 
     // ---- Breakout signals (computed league-wide by position) ----
@@ -630,8 +637,11 @@ const ENGINE = (() => {
         // Selling is for players past their age peak; young players who score well are keepers, not sells
         // Two reasons to sell: past the age peak, or overvalued against peers with similar production and age
         const agedSell = (0.5 * decline + 0.25 * nowRatio + 0.25 * peak) * (p.ageMult < 1 ? 1 : 0.3);
-        const overSell = p.valueGap != null ? clamp((p.valueGap - 0.15) / 0.4) : 0;
-        p.overvalued = p.valueGap != null && p.valueGap >= 0.2;
+        const overSell = p.valueGap != null && p.ageMult < 1.05 ? clamp((Math.min(p.valueGap, (p.ceilGap ?? p.valueGap) + 0.15) - 0.15) / 0.4) : 0;
+        // Overvalued only if his price beats both this season's output AND his proven best, and he's past
+        // the age where value includes expected growth. A star in a bad situation is a dip, not overvalued.
+        p.overvalued = p.valueGap != null && p.valueGap >= 0.25 && (p.ceilGap ?? p.valueGap) >= 0.1 && p.ageMult < 1.05;
+        p.situational = p.valueGap != null && p.valueGap >= 0.25 && (p.ceilGap ?? 1) < 0.1;
         p.undervalued = p.valueGap != null && p.valueGap <= -0.2;
         p.sell = Math.max(agedSell, overSell);
         if (p.undervalued) p.sell *= 0.4; // cheap for what he produces: a keeper
@@ -1606,7 +1616,7 @@ async function load(force) {
     status('Loading player details, season stats and trade history…');
     RAW_ROSTERS = rosters.map(r => ({ roster_id: r.roster_id, owner_id: r.owner_id }));
     const season = nfl?.season || league.season;
-    const [sleeperPlayers, stats, history, weekInfo, ktc, experts, historyKtc, tradeHistory, matchups, statsPrev] = await Promise.all([
+    const [sleeperPlayers, stats, history, weekInfo, ktc, experts, historyKtc, tradeHistory, matchups, statsPrev, statsPrev2] = await Promise.all([
       soft(force ? getJSON(`${SLEEPER}/players/nfl`) : cached('players', 86400000, () => getJSON(`${SLEEPER}/players/nfl`))),
       soft(getJSON(`${SLEEPER}/stats/nfl/regular/${season}`).catch(() => getJSON(`https://api.sleeper.com/stats/nfl/${season}?season_type=regular`))),
       soft(fetch('data/history.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
@@ -1617,8 +1627,9 @@ async function load(force) {
       soft(loadTradeHistory(league, nfl?.week)),
       soft(loadMatchups(league)),
       soft(cached(`stats:${+season - 1}`, 30 * 86400000, () => getJSON(`${SLEEPER}/stats/nfl/regular/${+season - 1}`))),
+      soft(cached(`stats:${+season - 2}`, 60 * 86400000, () => getJSON(`${SLEEPER}/stats/nfl/regular/${+season - 2}`))),
     ]);
-    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc, experts, matchups, statsPrev };
+    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc, experts, matchups, statsPrev, statsPrev2 };
     rebuild();
     const missing = [!tradeHistory && 'trade history', !stats && 'season stats', !trending && 'trending adds', !sleeperPlayers && 'player details'].filter(Boolean);
     status(`Updated ${new Date().toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` + (missing.length ? ` · couldn't load ${missing.join(', ')}, so those signals are skipped` : ''));
@@ -2210,6 +2221,7 @@ function renderMyTeam() {
     else if (a.dip) t += '<span class="tag buy" title="Value down but role intact: hold, don\'t sell low">dip · hold</span>';
     else if (a.sell >= 0.45) t += `<span class="tag sell">${a.overvalued && a.ageMult >= 0.95 ? 'overvalued' : 'sell high'}</span>`;
     else if (a.undervalued) t += `<span class="tag buy" title="Fair value about ${fmt(a.fairValue)}">cheap for his production</span>`;
+    else if (a.situational) t += `<span class="tag" title="This season's output is below his proven best (${(a.provenPpg || 0).toFixed(1)} a game)">output down, not overvalued</span>`;
     if (a.breakout >= 0.55) t += '<span class="tag buy">core</span>';
     if (starters.has(a.id)) t += '<span class="tag">starter</span>';
     if (a.taxiNext) t += `<span class="tag buy">taxi '${String(+RAW.league.season + 1).slice(2)}</span>`;
