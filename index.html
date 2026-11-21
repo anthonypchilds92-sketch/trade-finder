@@ -1102,10 +1102,14 @@ const ENGINE = (() => {
   // Was a trade sensible for one side, given their playoff chances when they made it?
   function judgeSide(sd, model, odds) {
     if (!sd.team) return null;
-    const projOf = a => a.kind === 'player' ? (model.players.get(a.id)?.projPpg ?? model.proj?.get(a.id)?.projPpg ?? 0) : 0;
-    const startPts = l => l.reduce((s, a) => s + (projOf(a) >= 7 ? projOf(a) : 0), 0);
+    // Change to their best possible starting lineup: rebuild their roster with and without the trade
+    const asPlayer = a => model.players.get(a.id) || { id: a.id, pos: a.pos, kind: 'player', projPpg: model.proj?.get(a.id)?.projPpg ?? 0 };
+    const gotP = sd.got.filter(a => a.kind === 'player').map(asPlayer), gaveP = sd.gave.filter(a => a.kind === 'player').map(asPlayer);
+    const moved = new Set([...gotP, ...gaveP].map(p => p.id));
+    const base = sd.team.players.filter(p => !moved.has(p.id) && !p.onTaxi);
+    const best = list => lineupValue(list.map(p => Object.assign(Object.create(p), { pp: p.projPpg ?? 0 })), model.slots, 'pp').total;
+    const pts = best(base.concat(gotP)) - best(base.concat(gaveP));
     const futOf = a => a.kind === 'pick' ? a.value : a.value * ageMult(a.pos, a.age);
-    const pts = startPts(sd.got) - startPts(sd.gave);
     const fut = pm(sd.got.map(futOf)) - pm(sd.gave.map(futOf));
     const price = sd.pct != null && Math.abs(sd.pct) >= 0.1 ? (sd.pct > 0 ? ` They also got good value (+${Math.round(sd.pct * 100)}%).` : ` They overpaid by about ${Math.round(-sd.pct * 100)}%.`) : '';
     const ptsTxt = `${pts >= 0 ? '+' : ''}${pts.toFixed(1)} projected points a week`;
