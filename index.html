@@ -131,10 +131,10 @@ const ENGINE = (() => {
     if (age == null || isNaN(age)) return 1;
     const a = Math.floor(age);
     const t = {
-      RB: [[23, 1.15], [24, 1.05], [25, 0.92], [26, 0.78], [27, 0.62], [28, 0.5], [99, 0.4]],
-      WR: [[23, 1.15], [25, 1.08], [26, 1.0], [27, 0.92], [28, 0.82], [29, 0.7], [30, 0.58], [99, 0.45]],
-      TE: [[24, 1.15], [27, 1.05], [28, 0.93], [29, 0.82], [30, 0.7], [99, 0.55]],
-      QB: [[25, 1.12], [29, 1.05], [32, 0.96], [33, 0.86], [34, 0.76], [99, 0.6]],
+      RB: [[23, 1.15], [24, 1.05], [25, 0.92], [26, 0.78], [27, 0.62], [28, 0.5], [29, 0.4], [31, 0.3], [99, 0.15]],
+      WR: [[23, 1.15], [25, 1.08], [26, 1.0], [27, 0.92], [28, 0.82], [29, 0.7], [30, 0.58], [31, 0.45], [33, 0.35], [99, 0.2]],
+      TE: [[24, 1.15], [27, 1.05], [28, 0.93], [29, 0.82], [30, 0.7], [32, 0.55], [34, 0.4], [99, 0.2]],
+      QB: [[25, 1.12], [29, 1.05], [32, 0.96], [33, 0.86], [34, 0.76], [35, 0.6], [37, 0.45], [39, 0.3], [99, 0.15]],
     }[pos];
     if (!t) return 1;
     for (const [lim, m] of t) if (a <= lim) return m;
@@ -299,7 +299,11 @@ const ENGINE = (() => {
         for (const [id, rid] of Object.entries(tx.drops || {})) sides[rid]?.gave.push(pl(id));
         for (const dp of tx.draft_picks || []) {
           const live = picksMap?.get(`pick:${dp.season}:${dp.round}:${dp.roster_id}`);
-          const pk = { kind: 'pick', season: String(dp.season), round: dp.round, origRoster: dp.roster_id, name: live ? live.name.replace(/ from .*$/, '') : `${dp.season} round ${dp.round}`, value: live ? live.value : pickValue(String(dp.season), dp.round, 'generic'), then: valueAt(`pick:${dp.season}:${dp.round}`, when), pos: 'PICK' };
+          // Value at the time on the same scale as today's: today's value × how that round's market has moved since
+          const hk = `pick:${dp.season}:${live?.r2 ?? dp.round}`;
+          const tRaw = valueAt(hk, when), tNow = valueAt(hk, Date.now() + 86400000);
+          const thenV = tRaw != null && live && tNow ? live.value * tRaw / tNow : tRaw;
+          const pk = { kind: 'pick', season: String(dp.season), round: dp.round, origRoster: dp.roster_id, name: live ? live.name.replace(/ from .*$/, '') : `${dp.season} round ${dp.round}`, value: live ? live.value : pickValue(String(dp.season), dp.round, 'generic'), then: thenV, pos: 'PICK' };
           sides[dp.owner_id]?.got.push(pk); sides[dp.previous_owner_id]?.gave.push(pk);
         }
         const entry = { when, season: set.season, leg: tx.leg ?? null, sides: [] };
@@ -726,7 +730,7 @@ const ENGINE = (() => {
       const equiv = base !== n || projected ? `${tier} ${ORD[r2] || 'R' + r2}${base !== n ? ` in a ${base}-team draft` : ''}` : null;
       const label = `${s} ${ord}` + (slotTxt ? ` (proj. ${slotTxt})` : '') + (+orig !== owner ? ` from ${origTeam.name}` : '');
       picks.set(`pick:${k}`, {
-        id: `pick:${k}`, kind: 'pick', owner, name: label, pos: 'PICK', season: s, round: +r, origRoster: +orig, equiv,
+        id: `pick:${k}`, kind: 'pick', owner, name: label, pos: 'PICK', season: s, round: +r, origRoster: +orig, equiv, r2,
         value, now: 0, future: value * 1.05, age: null, ageMult: 1, breakout: +r === 1 ? 0.35 : 0.15, sell: 0, trend: 0, signals: {}, dropPct: 0, dipFatigue: 0,
       });
     }
@@ -1120,7 +1124,12 @@ const ENGINE = (() => {
     const weeksLeft = ctx.weeksLeft ?? 6;
     const seasonPts = healthy * weeksLeft + Math.max(0, nowGain - healthy) * 1.5; // temporary cover counts for ~a week or two
     // Long-term value (age curves; picks at their projected value)
-    const futOf = a => a.kind === 'pick' ? a.value : a.value * ageMult(a.pos, a.age ?? asPlayer(a).age);
+    // Long-term value through this team's own lens (a rebuilding team gives veterans almost nothing)
+    const futOf = a => {
+      if (a.kind === 'pick') return stratFuture({ kind: 'pick', future: a.value, value: a.value }, team.strategy);
+      const am = ageMult(a.pos, a.age ?? asPlayer(a).age);
+      return stratFuture({ kind: 'player', pos: a.pos, future: a.value * am, ageMult: am, value: a.value }, team.strategy);
+    };
     const fut = pm(sd.got.map(futOf)) - pm(sd.gave.map(futOf));
     // Descriptions
     const depthRank = (p, roster) => roster.filter(x => x.pos === p.pos).sort((a, b) => (b.projPpg ?? 0) - (a.projPpg ?? 0)).findIndex(x => x.id === p.id) + 1;
@@ -1152,12 +1161,22 @@ const ENGINE = (() => {
         `Christmas has come early for ${name}: they've landed ${gotTxt} from ${from}, for the price of ${gaveTxt}.`,
         `Daylight robbery by ${name}${situ}: ${gotTxt}, and all it cost was ${gaveTxt}.`,
         `${name} turned ${gaveTxt} into ${gotTxt}. Their lineup barely notices, but their future does.`], seed) + price };
+    // 1b) Smaller long-term gain at no lineup cost
+    if (fut >= 300 && healthy >= -1.5)
+      return { label: 'Field goal', tone: 'good', text: pickOne([
+        `Nice bit of business from ${name}${situ}: ${gaveTxt} for ${gotTxt}. Long-term value up, lineup untouched.`,
+        `${name} quietly traded up: ${gotTxt} for ${gaveTxt}, and their lineup doesn't miss a beat.`], seed) + price };
     // 2) Spent real future value on a short-term or bench piece
     if (fut <= -800 && seasonPts < 35)
       return { label: 'Pick six', tone: 'bad', text: pickOne([
         `${name} handed over ${gaveTxt} for ${gotTxt}. ${nowGain > healthy + 2 ? 'That might help for a week while a starter is out, but' : 'He barely moves their lineup, and'} that's a steep price for a short stay.`,
         `Bold from ${name}${situ}: ${gaveTxt} out the door for ${gotTxt}, who adds roughly ${Math.max(0, nowGain).toFixed(1)} points a week at best, and only briefly.`,
         `${name} paid ${gaveTxt} for ${gotTxt}. Somewhere, ${from} ${others.length > 1 ? 'are' : 'is'} smiling.`], seed) + price };
+    // 2b) Smaller long-term loss for little on-field gain
+    if (fut <= -300 && seasonPts < 35)
+      return { label: 'Fumble', tone: 'bad', text: pickOne([
+        `${name}${situ} gave up ${gaveTxt} for ${gotTxt}, who adds about ${Math.max(0, healthy).toFixed(1)} points a week. Not much return for the price.`,
+        `${name} coughed up ${gaveTxt} for ${gotTxt}. Hard to see the upside${p != null && p < 0.25 ? ' with the playoffs this far away' : ''}.`], seed) + price };
     if (!odds) {
       if (fut >= 300) return { label: 'Field position', tone: 'accent', text: `${name} traded ${gaveTxt} for ${gotTxt}: a quiet bet on the future.${price}` };
       if (healthy >= 1.5) return { label: 'No-huddle', tone: 'accent', text: `${name} bought ${gotTxt} to win now (${ptsTxt}), paying with ${gaveTxt}.${price}` };
