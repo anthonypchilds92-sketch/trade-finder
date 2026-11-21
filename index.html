@@ -301,7 +301,7 @@ const ENGINE = (() => {
           const pk = { kind: 'pick', name: `${dp.season} round ${dp.round}`, value: pickValue(String(dp.season), dp.round, 'generic'), then: valueAt(`pick:${dp.season}:${dp.round}`, when), pos: 'PICK' };
           sides[dp.owner_id]?.got.push(pk); sides[dp.previous_owner_id]?.gave.push(pk);
         }
-        const entry = { when, season: set.season, sides: [] };
+        const entry = { when, season: set.season, leg: tx.leg ?? null, sides: [] };
         const allAssets = Object.values(sides).flatMap(sd => [...sd.got, ...sd.gave]);
         // Graded "at the time" only if we have a saved value for (nearly) everything that moved
         entry.atTime = allAssets.length > 0 && allAssets.filter(a => a.then != null || a.value < 200).length === allAssets.length;
@@ -384,7 +384,7 @@ const ENGINE = (() => {
       const u = userById.get(r.owner_id) || {};
       const s = r.settings || {};
       return {
-        rosterId: r.roster_id, ownerId: r.owner_id,
+        rosterId: r.roster_id, ownerId: r.owner_id, division: r.settings?.division ?? null,
         username: u.display_name || 'Unknown',
         name: u.metadata?.team_name || u.display_name || `Team ${r.roster_id}`,
         wins: s.wins || 0, losses: s.losses || 0, ties: s.ties || 0,
@@ -1054,6 +1054,86 @@ const ENGINE = (() => {
     return { ...RAW, fc: rows, history, trendLabel, pickTeams: src === 'ktc' ? 12 : undefined, valueLabel: src === 'blend' ? 'KTC + FantasyCalc blend' : 'KTC' };
   }
 
+  // ---- Playoff chances as of a given week (your league's rules) ----
+  // Top 2 in each division by wins (points tiebreak), then 2 wildcards by most points. Simulates the
+  // remaining regular season from each team's scoring so far.
+  function playoffOdds(model, matchups, schedule, asOf, regWeeks, sims = 2000) {
+    const teams = model.teams, ids = teams.map(t => t.rosterId);
+    const hist = new Map(ids.map(id => [id, []]));
+    const wins = new Map(ids.map(id => [id, 0])), pf = new Map(ids.map(id => [id, 0]));
+    for (let w = 1; w <= asOf; w++) {
+      const ms = matchups?.[w]; if (!ms) continue;
+      for (const m of ms) { hist.get(m.roster_id)?.push(m.points || 0); pf.set(m.roster_id, (pf.get(m.roster_id) || 0) + (m.points || 0)); }
+      const byM = {}; for (const m of ms) (byM[m.matchup_id] ??= []).push(m);
+      for (const pair of Object.values(byM)) if (pair.length === 2) {
+        const [a, b] = pair; if (a.points > b.points) wins.set(a.roster_id, wins.get(a.roster_id) + 1); else if (b.points > a.points) wins.set(b.roster_id, wins.get(b.roster_id) + 1);
+        else { wins.set(a.roster_id, wins.get(a.roster_id) + 0.5); wins.set(b.roster_id, wins.get(b.roster_id) + 0.5); }
+      }
+    }
+    const all = [...hist.values()].flat(), lgMean = all.length ? all.reduce((a, b) => a + b, 0) / all.length : 120;
+    // Shrink small samples towards the league average
+    const mean = new Map(ids.map(id => { const h = hist.get(id); const n = h.length; return [id, (h.reduce((a, b) => a + b, 0) + lgMean * 2) / (n + 2)]; }));
+    const SD = 24;
+    const rest = [];
+    for (let w = asOf + 1; w <= regWeeks; w++) {
+      const ms = (matchups?.[w]?.length ? matchups[w] : schedule?.[w]) || [];
+      const byM = {}; for (const m of ms) (byM[m.matchup_id] ??= []).push(m.roster_id);
+      rest.push(Object.values(byM).filter(p => p.length === 2));
+    }
+    const divOf = new Map(teams.map(t => [t.rosterId, t.division ?? 1]));
+    const made = new Map(ids.map(id => [id, 0]));
+    const gauss = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    for (let s = 0; s < sims; s++) {
+      const W = new Map(wins), P = new Map(pf);
+      for (const pairs of rest) for (const [a, b] of pairs) {
+        const pa = mean.get(a) + SD * gauss(), pb = mean.get(b) + SD * gauss();
+        P.set(a, P.get(a) + pa); P.set(b, P.get(b) + pb);
+        W.set(pa > pb ? a : b, W.get(pa > pb ? a : b) + 1);
+      }
+      const rank = (x, y) => W.get(y) - W.get(x) || P.get(y) - P.get(x);
+      const inP = new Set();
+      for (const d of new Set(divOf.values())) ids.filter(id => divOf.get(id) === d).sort(rank).slice(0, 2).forEach(id => inP.add(id));
+      ids.filter(id => !inP.has(id)).sort((x, y) => P.get(y) - P.get(x)).slice(0, 2).forEach(id => inP.add(id));
+      for (const id of inP) made.set(id, made.get(id) + 1);
+    }
+    return { pct: new Map(ids.map(id => [id, made.get(id) / sims])), wins, losses: new Map(ids.map(id => [id, Math.max(0, Math.min(asOf, (hist.get(id) || []).length) - wins.get(id))])) };
+  }
+
+  // Was a trade sensible for one side, given their playoff chances when they made it?
+  function judgeSide(sd, model, odds) {
+    if (!sd.team) return null;
+    const projOf = a => a.kind === 'player' ? (model.players.get(a.id)?.projPpg ?? model.proj?.get(a.id)?.projPpg ?? 0) : 0;
+    const startPts = l => l.reduce((s, a) => s + (projOf(a) >= 7 ? projOf(a) : 0), 0);
+    const futOf = a => a.kind === 'pick' ? a.value : a.value * ageMult(a.pos, a.age);
+    const pts = startPts(sd.got) - startPts(sd.gave);
+    const fut = pm(sd.got.map(futOf)) - pm(sd.gave.map(futOf));
+    const price = sd.pct != null && Math.abs(sd.pct) >= 0.1 ? (sd.pct > 0 ? ` They also got good value (+${Math.round(sd.pct * 100)}%).` : ` They overpaid by about ${Math.round(-sd.pct * 100)}%.`) : '';
+    const ptsTxt = `${pts >= 0 ? '+' : ''}${pts.toFixed(1)} projected points a week`;
+    if (!odds) {
+      if (fut >= 300 && pts <= 0) return { label: 'Building', tone: 'accent', text: `Traded current points (${ptsTxt}) for long-term value.${price}` };
+      if (pts >= 1.5 && fut < 0) return { label: 'Win-now', tone: 'accent', text: `Added points now (${ptsTxt}) at a cost to long-term value.${price}` };
+      return { label: 'Neutral', tone: 'muted', text: `Small effect on both this season and the future.${price}` };
+    }
+    const p = odds.pct.get(sd.team.rosterId) ?? 0, pc = Math.round(p * 100);
+    const rec = `${odds.wins.get(sd.team.rosterId)}–${odds.losses.get(sd.team.rosterId)}`;
+    const at = `${rec}, ${pc}% playoff chance`;
+    if (p >= 0.6) {
+      if (pts >= 1.5) return { label: 'Sensible', tone: 'good', text: `Contending (${at}) and added ${ptsTxt}.${price}` };
+      if (pts <= -1.5 && fut > 800) return { label: 'Bold', tone: 'warn', text: `Weakened their lineup (${ptsTxt}) while contending (${at}), for long-term value.${price}` };
+      if (pts <= -1.5) return { label: 'Questionable', tone: 'bad', text: `Gave up points (${ptsTxt}) while contending (${at}), without much future value back.${price}` };
+      return { label: 'Neutral', tone: 'muted', text: `Contending (${at}); little change to their lineup.${price}` };
+    }
+    if (p < 0.25) {
+      if (fut >= 300) return { label: 'Sensible', tone: 'good', text: `Playoffs unlikely (${at}), so turning current points into long-term value made sense.${price}` };
+      if (pts >= 1.5 && fut < -300) return { label: 'Questionable', tone: 'bad', text: `Bought points (${ptsTxt}) with only a ${pc}% playoff chance (${rec}), at a cost to the future.${price}` };
+      return { label: 'Neutral', tone: 'muted', text: `Playoffs unlikely (${at}); no big shift either way.${price}` };
+    }
+    if (pts >= 1.5 && fut >= -500) return { label: 'Sensible', tone: 'good', text: `On the bubble (${at}) and added ${ptsTxt} without hurting the future much.${price}` };
+    if (pts >= 1.5) return { label: 'Gamble', tone: 'warn', text: `On the bubble (${at}): added ${ptsTxt} but spent long-term value to do it.${price}` };
+    if (fut >= 300 && pts <= -1.5) return { label: 'Early sell', tone: 'warn', text: `Sold points (${ptsTxt}) for the future while still in the race (${at}).${price}` };
+    return { label: 'Neutral', tone: 'muted', text: `On the bubble (${at}); small effect either way.${price}` };
+  }
+
   // ---- Draft order: max PF (best possible lineup each week) excluding taxi players, regular season only ----
   // matchups: { [week]: [{ roster_id, players: [ids], players_points: {id: pts} }] }
   function draftOrder(model, matchups, regWeeks) {
@@ -1079,7 +1159,8 @@ const ENGINE = (() => {
       const left = Math.max(0, regWeeks - r.weeks);
       r.projected = r.maxPF + r.recentAvg * left;
     }
-    // Draft order uses actual max PF so far (lowest picks first); projected order shown separately
+    // (weeks with no scores yet are skipped)
+  // Draft order uses actual max PF so far (lowest picks first); projected order shown separately
     rows.slice().sort((a, b) => a.projected - b.projected).forEach((r, i) => { r.projSlot = i + 1; });
     rows.sort((a, b) => a.maxPF - b.maxPF);
     rows.forEach((r, i) => { r.slot = i + 1; });
@@ -1499,7 +1580,7 @@ const ENGINE = (() => {
   }
   const fmt = x => Math.round(x).toLocaleString('en-GB');
 
-  return { buildModel, applyValues, ktcCompare, draftOrder, generateTrades, offersFor, asksFor, weeklyNeeds, evaluateIncoming, freeAgents, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
+  return { buildModel, applyValues, ktcCompare, draftOrder, playoffOdds, judgeSide, generateTrades, offersFor, asksFor, weeklyNeeds, evaluateIncoming, freeAgents, learnFromOffers, offerKey, explain, theirSideReasons, lineupValue, ageMult, parsePick, packageValue, fmt };
 })();
 if (typeof module !== 'undefined') module.exports = ENGINE;
 /*ENGINE-END*/
@@ -1597,6 +1678,17 @@ async function loadMatchups(league) {
   return out;
 }
 
+// Remaining regular-season pairings (no scores yet), for playoff-chance simulations
+async function loadSchedule(league) {
+  const last = league.settings?.last_scored_leg || 0;
+  const reg = (league.settings?.playoff_week_start || 15) - 1;
+  const out = {};
+  await Promise.all(Array.from({ length: Math.max(0, reg - last) }, (_, i) => last + 1 + i).map(async w => {
+    out[w] = await getJSON(`${SLEEPER}/league/${LEAGUE_ID}/matchups/${w}`).then(ms => ms.map(m => ({ roster_id: m.roster_id, matchup_id: m.matchup_id }))).catch(() => null);
+  }));
+  return out;
+}
+
 async function load(force) {
   status('Fetching Sleeper and FantasyCalc…');
   try {
@@ -1616,7 +1708,7 @@ async function load(force) {
     status('Loading player details, season stats and trade history…');
     RAW_ROSTERS = rosters.map(r => ({ roster_id: r.roster_id, owner_id: r.owner_id }));
     const season = nfl?.season || league.season;
-    const [sleeperPlayers, stats, history, weekInfo, ktc, experts, historyKtc, tradeHistory, matchups, statsPrev, statsPrev2] = await Promise.all([
+    const [sleeperPlayers, stats, history, weekInfo, ktc, experts, historyKtc, tradeHistory, matchups, schedule, statsPrev, statsPrev2] = await Promise.all([
       soft(force ? getJSON(`${SLEEPER}/players/nfl`) : cached('players', 86400000, () => getJSON(`${SLEEPER}/players/nfl`))),
       soft(getJSON(`${SLEEPER}/stats/nfl/regular/${season}`).catch(() => getJSON(`https://api.sleeper.com/stats/nfl/${season}?season_type=regular`))),
       soft(fetch('data/history.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
@@ -1626,10 +1718,11 @@ async function load(force) {
       soft(fetch('data/history-ktc.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null)),
       soft(loadTradeHistory(league, nfl?.week)),
       soft(loadMatchups(league)),
+      soft(loadSchedule(league)),
       soft(cached(`stats:${+season - 1}`, 30 * 86400000, () => getJSON(`${SLEEPER}/stats/nfl/regular/${+season - 1}`))),
       soft(cached(`stats:${+season - 2}`, 60 * 86400000, () => getJSON(`${SLEEPER}/stats/nfl/regular/${+season - 2}`))),
     ]);
-    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc, experts, matchups, statsPrev, statsPrev2 };
+    RAW = { league, users, rosters, tradedPicks: tradedPicks || [], fc, sleeperPlayers, stats, trending: trending || [], myUsername: MY_USERNAME, week: nfl?.week, history, tradeHistory, weekInfo, ktc, historyKtc, experts, matchups, schedule, statsPrev, statsPrev2 };
     rebuild();
     const missing = [!tradeHistory && 'trade history', !stats && 'season stats', !trending && 'trending adds', !sleeperPlayers && 'player details'].filter(Boolean);
     status(`Updated ${new Date().toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` + (missing.length ? ` · couldn't load ${missing.join(', ')}, so those signals are skipped` : ''));
@@ -2287,6 +2380,14 @@ function renderLeague() {
   const gradeCol = g => g.startsWith('A') ? 'var(--good)' : g === 'B+' || g === 'B' ? 'var(--accent)' : g === 'C' ? 'var(--warn)' : 'var(--bad)';
   const record = new Map();
   const thenL = l => l.map(a => ({ value: a.then ?? a.value }));
+  const reg2 = (RAW.league.settings?.playoff_week_start || 15) - 1;
+  const oddsCache = new Map();
+  const oddsAt = leg => {
+    if (!RAW.matchups || leg == null) return null;
+    const asOf = Math.max(0, Math.min(reg2, leg - 1));
+    if (!oddsCache.has(asOf)) oddsCache.set(asOf, ENGINE.playoffOdds(MODEL, RAW.matchups, RAW.schedule, asOf, reg2, 1500));
+    return oddsCache.get(asOf);
+  };
   for (const e of log) {
     for (const sd of e.sides) {
       // Hindsight (today's values)
@@ -2299,6 +2400,8 @@ function renderLeague() {
       sd.net = got - gave; sd.pct = sd.net / Math.max(got, gave, 1); sd.grade = gradeOf(sd.pct);
       if (sd.team) { const r = record.get(sd.team) || { w: 0, l: 0, d: 0, net: 0 }; Math.abs(sd.pct) < 0.05 ? r.d++ : sd.net > 0 ? r.w++ : r.l++; r.net += sd.net; record.set(sd.team, r); }
     }
+    const odds = String(e.season) === String(RAW.league.season) && e.leg != null && e.leg <= reg2 ? oddsAt(e.leg) : null;
+    for (const sd of e.sides) sd.judge = ENGINE.judgeSide(sd, MODEL, odds);
     const best = e.sides.slice().sort((a, b) => b.net - a.net)[0];
     e.verdict = (e.atTime ? 'At the time: ' : '') + (Math.abs(best.pct) < 0.05 ? 'even trade' : `${best.teamName} won by ${fmt(best.net)} (${Math.round(best.pct * 100)}%)`);
     if (e.atTime) {
@@ -2310,9 +2413,9 @@ function renderLeague() {
   <p class="small">${log.length ? `From ${log.length} completed trade${log.length === 1 ? '' : 's'} (${seasons.join(', ')}). These tendencies feed into the trade scores, and managers who trade more often rank a little higher. Values are today's, so they show what kind of assets moved, not what they were worth at the time.` : 'No completed trades found in this league yet. Profiles will fill in as trades happen.'}</p>
   ${log.length ? `<div class="card">${MODEL.teams.slice().sort((a, b) => b.profile.trades - a.profile.trades).map(t => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(t.name)}</b>${t === MODEL.me ? ' <span class="tag buy">you</span>' : ''} <span class="small">· ${t.profile.trades} trade${t.profile.trades === 1 ? '' : 's'}${record.get(t) ? ` · record ${record.get(t).w}–${record.get(t).l}${record.get(t).d ? '–' + record.get(t).d : ''} · net ${record.get(t).net >= 0 ? '+' : ''}${fmt(record.get(t).net)}` : ''}</span><div>${t.profile.tags.map(g => `<span class="pill" style="margin:3px 4px 0 0">${esc(g)}</span>`).join('')}</div></div>`).join('')}</div>
   <h3 style="margin:18px 0 4px;font-size:16px">Recent trades</h3>
-  <p class="small">Graded on values from the day of the trade, for trades since the site started saving daily values (${esc((RAW.history?.dates || [])[0] || 'today')}). Older trades are graded on today's values, with hindsight. Each grade compares what a side got against what it gave, using KTC's value adjustment so a 2-for-1 is judged the way KTC would. A+ means a clear win, B is about even, F is a fleecing. Record is wins–losses(–evens).</p>
+  <p class="small">Each side also gets a verdict on whether the move suited their situation at the time: their record and simulated playoff chance (your league's rules), against the projected points a week the trade added or cost them now and the long-term value it added or cost them. Trades from earlier seasons are judged on what moved only. Grades are based on values from the day of the trade, for trades since the site started saving daily values (${esc((RAW.history?.dates || [])[0] || 'today')}). Older trades are graded on today's values, with hindsight. Each grade compares what a side got against what it gave, using KTC's value adjustment so a 2-for-1 is judged the way KTC would. A+ means a clear win, B is about even, F is a fleecing. Record is wins–losses(–evens).</p>
   ${log.slice(0, 12).map(e => `<div class="card"><div class="trade-top"><span class="small">${e.when ? new Date(e.when).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : e.season}</span><span class="small" style="text-align:right"><b>${esc(e.verdict)}</b>${e.hindsight ? `<br>${esc(e.hindsight)}` : ''}</span></div>
-    <div class="sides">${e.sides.map(sd => `<div class="side"><h4 style="display:flex;justify-content:space-between"><span>${esc(sd.teamName)} got</span><span style="font-size:18px;color:${gradeCol(sd.grade)};letter-spacing:0">${sd.grade}${e.atTime && sd.gradeNow !== sd.grade ? `<span class="small" style="font-size:11px;color:var(--muted)"> now ${sd.gradeNow}</span>` : ''}</span></h4>${sd.got.length ? sd.got.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}</div><div class="meta">${a.kind === 'pick' ? 'Draft pick' : esc(a.pos) + (a.age ? ' · ' + Math.floor(a.age) + ' then' : '')}</div></div><div class="val">${e.atTime && a.then != null ? `${fmt(a.then)}<div class="small">now ${fmt(a.value)}</div>` : fmt(a.value)}</div></div>`).join('') : '<div class="small">Nothing</div>'}</div>`).join('')}</div></div>`).join('')}` : ''}`;
+    <div class="sides">${e.sides.map(sd => `<div class="side"><h4 style="display:flex;justify-content:space-between"><span>${esc(sd.teamName)} got</span><span style="font-size:18px;color:${gradeCol(sd.grade)};letter-spacing:0">${sd.grade}${e.atTime && sd.gradeNow !== sd.grade ? `<span class="small" style="font-size:11px;color:var(--muted)"> now ${sd.gradeNow}</span>` : ''}</span></h4>${sd.got.length ? sd.got.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}</div><div class="meta">${a.kind === 'pick' ? 'Draft pick' : esc(a.pos) + (a.age ? ' · ' + Math.floor(a.age) + ' then' : '')}</div></div><div class="val">${e.atTime && a.then != null ? `${fmt(a.then)}<div class="small">now ${fmt(a.value)}</div>` : fmt(a.value)}</div></div>`).join('') : '<div class="small">Nothing</div>'}${sd.judge ? `<div class="small" style="margin-top:8px;padding-top:6px;border-top:1px solid var(--line)"><b style="color:${{ good: 'var(--good)', bad: 'var(--bad)', warn: 'var(--warn)', accent: 'var(--accent)', muted: 'var(--muted)' }[sd.judge.tone]}">${esc(sd.judge.label)}:</b> ${esc(sd.judge.text)}</div>` : ''}</div>`).join('')}</div></div>`).join('')}` : ''}`;
   $('#tab-league').insertAdjacentHTML('beforeend', profHtml);
   $('#tab-league').querySelectorAll('select').forEach(s => s.onchange = () => { prefs.strategy[s.dataset.r] = s.value; savePrefs(); rebuild(); });
 }
