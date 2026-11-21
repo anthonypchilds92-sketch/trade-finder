@@ -1634,6 +1634,7 @@ if (typeof module !== 'undefined') module.exports = ENGINE;
 
 <script>
 // ---------- App (data loading + UI) ----------
+const SITE_VERSION = '21 Nov 2026, 11:40 (NFL verdict labels)';
 const LEAGUE_ID = '1312072052827521024';
 const MY_USERNAME = 'childsy14';
 const SLEEPER = 'https://api.sleeper.app/v1';
@@ -2487,6 +2488,7 @@ function renderSettings() {
       <select id="s-n">${[10, 20, 30].map(v => `<option ${prefs.maxResults == v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
     <div class="row" style="margin-top:10px"><button class="btn ghost" id="s-reset">Reset strategies and marks</button></div>
     <p class="small">Data: Sleeper (rosters, picks, stats, trending adds) and <a href="https://fantasycalc.com" target="_blank" rel="noopener">FantasyCalc</a> (trade values, based on real trades) and KeepTradeCut (crowd values, read daily). Settings are saved in this browser only.</p>
+    <p class="small">Site version: <b>${SITE_VERSION}</b>. If this looks out of date, close the app fully and reopen it, or wait about 10 minutes.</p>
   </div>`;
   $('#s-src').onchange = e => { prefs.valueSource = e.target.value; savePrefs(); rebuild(); };
   $('#s-fair').onchange = e => { prefs.fairness = +e.target.value; savePrefs(); rebuild(); };
