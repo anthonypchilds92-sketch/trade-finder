@@ -1106,7 +1106,7 @@ const ENGINE = (() => {
     const asPlayer = a => model.players.get(a.id) || { id: a.id, pos: a.pos, kind: 'player', projPpg: model.proj?.get(a.id)?.projPpg ?? 0 };
     const gotP = sd.got.filter(a => a.kind === 'player').map(asPlayer), gaveP = sd.gave.filter(a => a.kind === 'player').map(asPlayer);
     const moved = new Set([...gotP, ...gaveP].map(p => p.id));
-    const base = sd.team.players.filter(p => !moved.has(p.id) && !p.onTaxi);
+    const base = sd.team.players.filter(p => !moved.has(p.id)); // taxi players count: a contender can activate them
     const best = list => lineupValue(list.map(p => Object.assign(Object.create(p), { pp: p.projPpg ?? 0 })), model.slots, 'pp').total;
     const pts = best(base.concat(gotP)) - best(base.concat(gaveP));
     const futOf = a => a.kind === 'pick' ? a.value : a.value * ageMult(a.pos, a.age);
@@ -1483,7 +1483,7 @@ const ENGINE = (() => {
   }
 
   // Projected weekly points of a team's best lineup
-  const lineupPts = list => lineupValue(list.filter(p => p.kind === 'player' && !p.onTaxi).map(p => Object.assign(Object.create(p), { pp: p.projPpg ?? p.ppg ?? 0 })), model_slots, 'pp').total;
+  const lineupPts = list => lineupValue(list.filter(p => p.kind === 'player').map(p => Object.assign(Object.create(p), { pp: p.projPpg ?? p.ppg ?? 0 })), model_slots, 'pp').total;
   let model_slots = [];
   function pointsDelta(tr, model) {
     model_slots = model.slots;
