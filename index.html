@@ -1132,10 +1132,11 @@ const ENGINE = (() => {
     };
     const fut = pm(sd.got.map(futOf)) - pm(sd.gave.map(futOf));
     // Descriptions
-    const depthRank = (p, roster) => roster.filter(x => x.pos === p.pos).sort((a, b) => (b.projPpg ?? 0) - (a.projPpg ?? 0)).findIndex(x => x.id === p.id) + 1;
+    // Rank among the team's players at that position by trade value (taxi squad included)
+    const depthRank = (p, roster) => roster.filter(x => x.pos === p.pos).sort((a, b) => (b.value ?? 0) - (a.value ?? 0)).findIndex(x => x.id === p.id) + 1;
     const descPlayer = (a, roster) => {
       const p = asPlayer(a), age = Math.floor(a.age ?? p.age ?? 0), rk = depthRank(p, roster);
-      const role = rk >= 3 && p.pos === 'QB' || rk >= 4 && p.pos !== 'QB' ? `, their ${ORDN(rk)}-choice ${p.pos}` : '';
+      const role = rk >= 3 && p.pos === 'QB' || rk >= 4 && p.pos !== 'QB' ? `, their ${ORDN(rk)}-most valuable ${p.pos}` : '';
       return `${age ? age + '-year-old ' : ''}${p.pos} ${p.name || a.name}${role}`;
     };
     const descPick = a => {
@@ -1653,7 +1654,7 @@ if (typeof module !== 'undefined') module.exports = ENGINE;
 
 <script>
 // ---------- App (data loading + UI) ----------
-const SITE_VERSION = '21 Nov 2026, 11:40 (NFL verdict labels)';
+const SITE_VERSION = '21 Nov 2026, 11:58 (depth by value)';
 const LEAGUE_ID = '1312072052827521024';
 const MY_USERNAME = 'childsy14';
 const SLEEPER = 'https://api.sleeper.app/v1';
