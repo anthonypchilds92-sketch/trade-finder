@@ -266,7 +266,7 @@ const ENGINE = (() => {
   // ---- Trade history: what each manager tends to do ----
   // tradeHistory = [{ season, rosters: [{roster_id, owner_id}], txns: [...] }]
   // Values are today's FantasyCalc values (a guide to what moved, not what it was worth at the time).
-  function buildTendencies(tradeHistory, teams, { fcById, sleeperPlayers, pickValue, history }) {
+  function buildTendencies(tradeHistory, teams, { fcById, sleeperPlayers, pickValue, history, picksMap }) {
     const log = [];
     // Value on the day of the trade, from the saved daily history (null if the trade predates it)
     const hDates = (history?.dates || []).map(d => Date.parse(d));
@@ -298,7 +298,8 @@ const ENGINE = (() => {
         for (const [id, rid] of Object.entries(tx.adds || {})) sides[rid]?.got.push(pl(id));
         for (const [id, rid] of Object.entries(tx.drops || {})) sides[rid]?.gave.push(pl(id));
         for (const dp of tx.draft_picks || []) {
-          const pk = { kind: 'pick', name: `${dp.season} round ${dp.round}`, value: pickValue(String(dp.season), dp.round, 'generic'), then: valueAt(`pick:${dp.season}:${dp.round}`, when), pos: 'PICK' };
+          const live = picksMap?.get(`pick:${dp.season}:${dp.round}:${dp.roster_id}`);
+          const pk = { kind: 'pick', season: String(dp.season), round: dp.round, origRoster: dp.roster_id, name: live ? live.name.replace(/ from .*$/, '') : `${dp.season} round ${dp.round}`, value: live ? live.value : pickValue(String(dp.season), dp.round, 'generic'), then: valueAt(`pick:${dp.season}:${dp.round}`, when), pos: 'PICK' };
           sides[dp.owner_id]?.got.push(pk); sides[dp.previous_owner_id]?.gave.push(pk);
         }
         const entry = { when, season: set.season, leg: tx.leg ?? null, sides: [] };
@@ -734,7 +735,7 @@ const ENGINE = (() => {
       t.assets = [...t.playerIds.map(id => players.get(id)), ...[...picks.values()].filter(p => p.owner === t.rosterId)];
       t.players = t.assets.filter(a => a.kind === 'player');
     }
-    const tradeLog = buildTendencies(input.tradeHistory, teams, { fcById, sleeperPlayers, pickValue, history: input.history });
+    const tradeLog = buildTendencies(input.tradeHistory, teams, { fcById, sleeperPlayers, pickValue, history: input.history, picksMap: picks });
     TREND_LABEL = input.trendLabel || 'in 30 days';
     return { trendLabel: input.trendLabel || null, league, slots, season, teams, teamById, players, picks, me, haveStats, haveTrending: trendMap.size > 0, histSpan: hist?.span || 0, tradeLog,
       fcById, sleeperPlayers, trendMap, statMap, maxTrend, rostered: new Set(teams.flatMap(t => t.playerIds)), proj, fit, featMode, fairFit };
@@ -1099,43 +1100,84 @@ const ENGINE = (() => {
     return { pct: new Map(ids.map(id => [id, made.get(id) / sims])), wins, losses: new Map(ids.map(id => [id, Math.max(0, Math.min(asOf, (hist.get(id) || []).length) - wins.get(id))])) };
   }
 
-  // Was a trade sensible for one side, given their playoff chances when they made it?
-  function judgeSide(sd, model, odds) {
+  // Was a trade sensible for one side, given their playoff chances when they made it? (with a bit of fun)
+  const ORDN = n => n + (['th', 'st', 'nd', 'rd'][(n % 100 >= 11 && n % 100 <= 13) ? 0 : n % 10] || 'th');
+  const pickOne = (arr, seed) => { let h = 0; for (const c of seed) h = (h * 31 + c.charCodeAt(0)) >>> 0; return arr[h % arr.length]; };
+  function judgeSide(sd, model, odds, ctx = {}) {
     if (!sd.team) return null;
-    // Change to their best possible starting lineup: rebuild their roster with and without the trade
-    const asPlayer = a => model.players.get(a.id) || { id: a.id, pos: a.pos, kind: 'player', projPpg: model.proj?.get(a.id)?.projPpg ?? 0 };
+    const team = sd.team, name = team.name;
+    const others = (ctx.entry?.sides || []).filter(x => x !== sd).map(x => x.teamName);
+    const from = others.length ? others.join(' and ') : 'their trade partner';
+    const OUTR = /^(IR|PUP|OUT|DOUBTFUL|SUS|NFI)/i;
+    // Lineup now (injuries count as zero) and when everyone is healthy
+    const asPlayer = a => model.players.get(a.id) || { id: a.id, pos: a.pos, kind: 'player', age: a.age, projPpg: model.proj?.get(a.id)?.projPpg ?? 0 };
     const gotP = sd.got.filter(a => a.kind === 'player').map(asPlayer), gaveP = sd.gave.filter(a => a.kind === 'player').map(asPlayer);
     const moved = new Set([...gotP, ...gaveP].map(p => p.id));
-    const base = sd.team.players.filter(p => !moved.has(p.id)); // taxi players count: a contender can activate them
-    const best = list => lineupValue(list.map(p => Object.assign(Object.create(p), { pp: p.projPpg ?? 0 })), model.slots, 'pp').total;
-    const pts = best(base.concat(gotP)) - best(base.concat(gaveP));
-    const futOf = a => a.kind === 'pick' ? a.value : a.value * ageMult(a.pos, a.age);
+    const base = team.players.filter(p => !moved.has(p.id));
+    const best = (list, hurt) => lineupValue(list.map(p => Object.assign(Object.create(p), { pp: hurt && OUTR.test(p.injury || '') ? 0 : (p.projPpg ?? 0) })), model.slots, 'pp').total;
+    const healthy = best(base.concat(gotP)) - best(base.concat(gaveP));
+    const nowGain = best(base.concat(gotP), true) - best(base.concat(gaveP), true);
+    const weeksLeft = ctx.weeksLeft ?? 6;
+    const seasonPts = healthy * weeksLeft + Math.max(0, nowGain - healthy) * 1.5; // temporary cover counts for ~a week or two
+    // Long-term value (age curves; picks at their projected value)
+    const futOf = a => a.kind === 'pick' ? a.value : a.value * ageMult(a.pos, a.age ?? asPlayer(a).age);
     const fut = pm(sd.got.map(futOf)) - pm(sd.gave.map(futOf));
-    const price = sd.pct != null && Math.abs(sd.pct) >= 0.1 ? (sd.pct > 0 ? ` They also got good value (+${Math.round(sd.pct * 100)}%).` : ` They overpaid by about ${Math.round(-sd.pct * 100)}%.`) : '';
-    const ptsTxt = `${pts >= 0 ? '+' : ''}${pts.toFixed(1)} projected points a week`;
+    // Descriptions
+    const depthRank = (p, roster) => roster.filter(x => x.pos === p.pos).sort((a, b) => (b.projPpg ?? 0) - (a.projPpg ?? 0)).findIndex(x => x.id === p.id) + 1;
+    const descPlayer = (a, roster) => {
+      const p = asPlayer(a), age = Math.floor(a.age ?? p.age ?? 0), rk = depthRank(p, roster);
+      const role = rk >= 3 && p.pos === 'QB' || rk >= 4 && p.pos !== 'QB' ? `, their ${ORDN(rk)}-choice ${p.pos}` : '';
+      return `${age ? age + '-year-old ' : ''}${p.pos} ${p.name || a.name}${role}`;
+    };
+    const descPick = a => {
+      const o = a.origRoster != null ? model.teamById.get(a.origRoster) : null;
+      const proj = a.name.match(/proj\. (\d)\.(\d\d)/);
+      const high = proj && +proj[2] <= Math.ceil(model.teams.length / 3);
+      const bits = [];
+      if (proj) bits.push(`projected ${proj[1]}.${proj[2]}`);
+      if (o && !others.includes(o.name)) bits.push(o === team ? 'their own' : `${o.name}'s own`);
+      if (o && o.projSlot && o.projSlot <= 3) bits.push(`${o === team ? "they're" : 'one of'} the league's bottom three`.replace("they're the", "and they're in the").replace('one of the', 'from one of the'));
+      return `${high ? 'a high ' : 'a '}${a.season} ${ORDN(a.round)}-round pick${bits.length ? ` (${bits.join(', ')})` : ''}`;
+    };
+    const desc = (list, roster) => list.length ? list.slice().sort((a, b) => b.value - a.value).map(a => a.kind === 'pick' ? descPick(a) : descPlayer(a, roster)).join(' and ') : 'nothing';
+    const gotTxt = desc(sd.got, base.concat(gotP)), gaveTxt = desc(sd.gave, base.concat(gaveP));
+    const price = sd.pct != null && sd.pct <= -0.1 ? ` On KTC they paid about ${Math.round(-sd.pct * 100)}% over the odds.` : sd.pct >= 0.1 ? ` On KTC they came out ${Math.round(sd.pct * 100)}% ahead.` : '';
+    const p = odds ? odds.pct.get(team.rosterId) ?? 0 : null, pc = p != null ? Math.round(p * 100) : null;
+    const situ = odds ? ` (${odds.wins.get(team.rosterId)}–${odds.losses.get(team.rosterId)}, ${pc}% playoff chance at the time)` : '';
+    const ptsTxt = `${healthy >= 0 ? '+' : ''}${healthy.toFixed(1)} points a week`;
+    const seed = name + gotTxt;
+    // 1) Free long-term value without hurting the lineup
+    if (fut >= 800 && healthy >= -1.5)
+      return { label: 'Christmas came early', tone: 'good', text: pickOne([
+        `Christmas has come early for ${name}: they've landed ${gotTxt} from ${from}, for the price of ${gaveTxt}.`,
+        `Daylight robbery by ${name}${situ}: ${gotTxt}, and all it cost was ${gaveTxt}.`,
+        `${name} turned ${gaveTxt} into ${gotTxt}. Their lineup barely notices, but their future does.`], seed) + price };
+    // 2) Spent real future value on a short-term or bench piece
+    if (fut <= -800 && seasonPts < 35)
+      return { label: 'Overpaid for a rental', tone: 'bad', text: pickOne([
+        `${name} handed over ${gaveTxt} for ${gotTxt}. ${nowGain > healthy + 2 ? 'That might help for a week while a starter is out, but' : 'He barely moves their lineup, and'} that's a steep price for a short stay.`,
+        `Bold from ${name}${situ}: ${gaveTxt} out the door for ${gotTxt}, who adds roughly ${Math.max(0, nowGain).toFixed(1)} points a week at best, and only briefly.`,
+        `${name} paid ${gaveTxt} for ${gotTxt}. Somewhere, ${from} ${others.length > 1 ? 'are' : 'is'} smiling.`], seed) + price };
     if (!odds) {
-      if (fut >= 300 && pts <= 0) return { label: 'Building', tone: 'accent', text: `Traded current points (${ptsTxt}) for long-term value.${price}` };
-      if (pts >= 1.5 && fut < 0) return { label: 'Win-now', tone: 'accent', text: `Added points now (${ptsTxt}) at a cost to long-term value.${price}` };
-      return { label: 'Neutral', tone: 'muted', text: `Small effect on both this season and the future.${price}` };
+      if (fut >= 300) return { label: 'Building', tone: 'accent', text: `${name} traded ${gaveTxt} for ${gotTxt}: a quiet bet on the future.${price}` };
+      if (healthy >= 1.5) return { label: 'Win-now', tone: 'accent', text: `${name} bought ${gotTxt} to win now (${ptsTxt}), paying with ${gaveTxt}.${price}` };
+      return { label: 'Neutral', tone: 'muted', text: `${name} shuffled the deckchairs: ${gaveTxt} for ${gotTxt}.${price}` };
     }
-    const p = odds.pct.get(sd.team.rosterId) ?? 0, pc = Math.round(p * 100);
-    const rec = `${odds.wins.get(sd.team.rosterId)}–${odds.losses.get(sd.team.rosterId)}`;
-    const at = `${rec}, ${pc}% playoff chance`;
     if (p >= 0.6) {
-      if (pts >= 1.5) return { label: 'Sensible', tone: 'good', text: `Contending (${at}) and added ${ptsTxt}.${price}` };
-      if (pts <= -1.5 && fut > 800) return { label: 'Bold', tone: 'warn', text: `Weakened their lineup (${ptsTxt}) while contending (${at}), for long-term value.${price}` };
-      if (pts <= -1.5) return { label: 'Questionable', tone: 'bad', text: `Gave up points (${ptsTxt}) while contending (${at}), without much future value back.${price}` };
-      return { label: 'Neutral', tone: 'muted', text: `Contending (${at}); little change to their lineup.${price}` };
+      if (healthy >= 1.5) return { label: 'Sensible', tone: 'good', text: `${name} are going for it${situ}, and ${gotTxt} adds ${ptsTxt}. Sensible, for a contender.${price}` };
+      if (healthy <= -1.5 && fut > 800) return { label: 'Bold', tone: 'warn', text: `${name} weakened their lineup (${ptsTxt}) while contending${situ}, betting on the future with ${gotTxt}.${price}` };
+      if (healthy <= -1.5) return { label: 'Questionable', tone: 'bad', text: `${name} gave away points (${ptsTxt}) mid-title-push${situ}, and didn't get much future back for it.${price}` };
+      return { label: 'Neutral', tone: 'muted', text: `${name}${situ} swapped ${gaveTxt} for ${gotTxt}: not much change either way.${price}` };
     }
     if (p < 0.25) {
-      if (fut >= 300) return { label: 'Sensible', tone: 'good', text: `Playoffs unlikely (${at}), so turning current points into long-term value made sense.${price}` };
-      if (pts >= 1.5 && fut < -300) return { label: 'Questionable', tone: 'bad', text: `Bought points (${ptsTxt}) with only a ${pc}% playoff chance (${rec}), at a cost to the future.${price}` };
-      return { label: 'Neutral', tone: 'muted', text: `Playoffs unlikely (${at}); no big shift either way.${price}` };
+      if (fut >= 300) return { label: 'Sensible', tone: 'good', text: `With the playoffs a long shot${situ}, ${name} cashed in ${gaveTxt} for ${gotTxt}. Good rebuilding.${price}` };
+      if (healthy >= 1.5 && fut < -300) return { label: 'Questionable', tone: 'bad', text: `${name}${situ} bought points (${ptsTxt}) with a ${pc}% playoff chance. Brave, if nothing else.${price}` };
+      return { label: 'Neutral', tone: 'muted', text: `${name}${situ} made a small move: ${gaveTxt} for ${gotTxt}.${price}` };
     }
-    if (pts >= 1.5 && fut >= -500) return { label: 'Sensible', tone: 'good', text: `On the bubble (${at}) and added ${ptsTxt} without hurting the future much.${price}` };
-    if (pts >= 1.5) return { label: 'Gamble', tone: 'warn', text: `On the bubble (${at}): added ${ptsTxt} but spent long-term value to do it.${price}` };
-    if (fut >= 300 && pts <= -1.5) return { label: 'Early sell', tone: 'warn', text: `Sold points (${ptsTxt}) for the future while still in the race (${at}).${price}` };
-    return { label: 'Neutral', tone: 'muted', text: `On the bubble (${at}); small effect either way.${price}` };
+    if (healthy >= 1.5 && fut >= -500) return { label: 'Sensible', tone: 'good', text: `On the bubble${situ}, ${name} added ${ptsTxt} without mortgaging the future.${price}` };
+    if (healthy >= 1.5) return { label: 'Gamble', tone: 'warn', text: `${name} rolled the dice${situ}: ${ptsTxt} now, paid for with future value.${price}` };
+    if (fut >= 300 && healthy <= -1.5) return { label: 'Early sell', tone: 'warn', text: `${name} sold points (${ptsTxt}) for the future while still in the race${situ}.${price}` };
+    return { label: 'Neutral', tone: 'muted', text: `${name}${situ} made a small swap: ${gaveTxt} for ${gotTxt}.${price}` };
   }
 
   // ---- Draft order: max PF (best possible lineup each week) excluding taxi players, regular season only ----
@@ -2405,7 +2447,8 @@ function renderLeague() {
       if (sd.team) { const r = record.get(sd.team) || { w: 0, l: 0, d: 0, net: 0 }; Math.abs(sd.pct) < 0.05 ? r.d++ : sd.net > 0 ? r.w++ : r.l++; r.net += sd.net; record.set(sd.team, r); }
     }
     const odds = String(e.season) === String(RAW.league.season) && e.leg != null && e.leg <= reg2 ? oddsAt(e.leg) : null;
-    for (const sd of e.sides) sd.judge = ENGINE.judgeSide(sd, MODEL, odds);
+    const weeksLeft = Math.max(1, reg2 - (RAW.league.settings?.last_scored_leg || 0)) + 3;
+    for (const sd of e.sides) sd.judge = ENGINE.judgeSide(sd, MODEL, odds, { entry: e, weeksLeft });
     const best = e.sides.slice().sort((a, b) => b.net - a.net)[0];
     e.verdict = (e.atTime ? 'At the time: ' : '') + (Math.abs(best.pct) < 0.05 ? 'even trade' : `${best.teamName} won by ${fmt(best.net)} (${Math.round(best.pct * 100)}%)`);
     if (e.atTime) {
