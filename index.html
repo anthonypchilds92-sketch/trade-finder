@@ -1148,36 +1148,36 @@ const ENGINE = (() => {
     const seed = name + gotTxt;
     // 1) Free long-term value without hurting the lineup
     if (fut >= 800 && healthy >= -1.5)
-      return { label: 'Christmas came early', tone: 'good', text: pickOne([
+      return { label: 'Touchdown', tone: 'good', text: pickOne([
         `Christmas has come early for ${name}: they've landed ${gotTxt} from ${from}, for the price of ${gaveTxt}.`,
         `Daylight robbery by ${name}${situ}: ${gotTxt}, and all it cost was ${gaveTxt}.`,
         `${name} turned ${gaveTxt} into ${gotTxt}. Their lineup barely notices, but their future does.`], seed) + price };
     // 2) Spent real future value on a short-term or bench piece
     if (fut <= -800 && seasonPts < 35)
-      return { label: 'Overpaid for a rental', tone: 'bad', text: pickOne([
+      return { label: 'Pick six', tone: 'bad', text: pickOne([
         `${name} handed over ${gaveTxt} for ${gotTxt}. ${nowGain > healthy + 2 ? 'That might help for a week while a starter is out, but' : 'He barely moves their lineup, and'} that's a steep price for a short stay.`,
         `Bold from ${name}${situ}: ${gaveTxt} out the door for ${gotTxt}, who adds roughly ${Math.max(0, nowGain).toFixed(1)} points a week at best, and only briefly.`,
         `${name} paid ${gaveTxt} for ${gotTxt}. Somewhere, ${from} ${others.length > 1 ? 'are' : 'is'} smiling.`], seed) + price };
     if (!odds) {
-      if (fut >= 300) return { label: 'Building', tone: 'accent', text: `${name} traded ${gaveTxt} for ${gotTxt}: a quiet bet on the future.${price}` };
-      if (healthy >= 1.5) return { label: 'Win-now', tone: 'accent', text: `${name} bought ${gotTxt} to win now (${ptsTxt}), paying with ${gaveTxt}.${price}` };
-      return { label: 'Neutral', tone: 'muted', text: `${name} shuffled the deckchairs: ${gaveTxt} for ${gotTxt}.${price}` };
+      if (fut >= 300) return { label: 'Field position', tone: 'accent', text: `${name} traded ${gaveTxt} for ${gotTxt}: a quiet bet on the future.${price}` };
+      if (healthy >= 1.5) return { label: 'No-huddle', tone: 'accent', text: `${name} bought ${gotTxt} to win now (${ptsTxt}), paying with ${gaveTxt}.${price}` };
+      return { label: 'Fair catch', tone: 'muted', text: `${name} shuffled the deckchairs: ${gaveTxt} for ${gotTxt}.${price}` };
     }
     if (p >= 0.6) {
-      if (healthy >= 1.5) return { label: 'Sensible', tone: 'good', text: `${name} are going for it${situ}, and ${gotTxt} adds ${ptsTxt}. Sensible, for a contender.${price}` };
-      if (healthy <= -1.5 && fut > 800) return { label: 'Bold', tone: 'warn', text: `${name} weakened their lineup (${ptsTxt}) while contending${situ}, betting on the future with ${gotTxt}.${price}` };
-      if (healthy <= -1.5) return { label: 'Questionable', tone: 'bad', text: `${name} gave away points (${ptsTxt}) mid-title-push${situ}, and didn't get much future back for it.${price}` };
-      return { label: 'Neutral', tone: 'muted', text: `${name}${situ} swapped ${gaveTxt} for ${gotTxt}: not much change either way.${price}` };
+      if (healthy >= 1.5) return { label: 'Field goal', tone: 'good', text: `${name} are going for it${situ}, and ${gotTxt} adds ${ptsTxt}. Sensible, for a contender.${price}` };
+      if (healthy <= -1.5 && fut > 800) return { label: 'Hail Mary', tone: 'warn', text: `${name} weakened their lineup (${ptsTxt}) while contending${situ}, betting on the future with ${gotTxt}.${price}` };
+      if (healthy <= -1.5) return { label: 'Fumble', tone: 'bad', text: `${name} gave away points (${ptsTxt}) mid-title-push${situ}, and didn't get much future back for it.${price}` };
+      return { label: 'Fair catch', tone: 'muted', text: `${name}${situ} swapped ${gaveTxt} for ${gotTxt}: not much change either way.${price}` };
     }
     if (p < 0.25) {
-      if (fut >= 300) return { label: 'Sensible', tone: 'good', text: `With the playoffs a long shot${situ}, ${name} cashed in ${gaveTxt} for ${gotTxt}. Good rebuilding.${price}` };
-      if (healthy >= 1.5 && fut < -300) return { label: 'Questionable', tone: 'bad', text: `${name}${situ} bought points (${ptsTxt}) with a ${pc}% playoff chance. Brave, if nothing else.${price}` };
-      return { label: 'Neutral', tone: 'muted', text: `${name}${situ} made a small move: ${gaveTxt} for ${gotTxt}.${price}` };
+      if (fut >= 300) return { label: 'Field goal', tone: 'good', text: `With the playoffs a long shot${situ}, ${name} cashed in ${gaveTxt} for ${gotTxt}. Good rebuilding.${price}` };
+      if (healthy >= 1.5 && fut < -300) return { label: 'Fumble', tone: 'bad', text: `${name}${situ} bought points (${ptsTxt}) with a ${pc}% playoff chance. Brave, if nothing else.${price}` };
+      return { label: 'Fair catch', tone: 'muted', text: `${name}${situ} made a small move: ${gaveTxt} for ${gotTxt}.${price}` };
     }
-    if (healthy >= 1.5 && fut >= -500) return { label: 'Sensible', tone: 'good', text: `On the bubble${situ}, ${name} added ${ptsTxt} without mortgaging the future.${price}` };
-    if (healthy >= 1.5) return { label: 'Gamble', tone: 'warn', text: `${name} rolled the dice${situ}: ${ptsTxt} now, paid for with future value.${price}` };
-    if (fut >= 300 && healthy <= -1.5) return { label: 'Early sell', tone: 'warn', text: `${name} sold points (${ptsTxt}) for the future while still in the race${situ}.${price}` };
-    return { label: 'Neutral', tone: 'muted', text: `${name}${situ} made a small swap: ${gaveTxt} for ${gotTxt}.${price}` };
+    if (healthy >= 1.5 && fut >= -500) return { label: 'Field goal', tone: 'good', text: `On the bubble${situ}, ${name} added ${ptsTxt} without mortgaging the future.${price}` };
+    if (healthy >= 1.5) return { label: 'Going for it on 4th', tone: 'warn', text: `${name} rolled the dice${situ}: ${ptsTxt} now, paid for with future value.${price}` };
+    if (fut >= 300 && healthy <= -1.5) return { label: 'Punt', tone: 'warn', text: `${name} sold points (${ptsTxt}) for the future while still in the race${situ}.${price}` };
+    return { label: 'Fair catch', tone: 'muted', text: `${name}${situ} made a small swap: ${gaveTxt} for ${gotTxt}.${price}` };
   }
 
   // ---- Draft order: max PF (best possible lineup each week) excluding taxi players, regular season only ----
@@ -2460,6 +2460,7 @@ function renderLeague() {
   <p class="small">${log.length ? `From ${log.length} completed trade${log.length === 1 ? '' : 's'} (${seasons.join(', ')}). These tendencies feed into the trade scores, and managers who trade more often rank a little higher. Values are today's, so they show what kind of assets moved, not what they were worth at the time.` : 'No completed trades found in this league yet. Profiles will fill in as trades happen.'}</p>
   ${log.length ? `<div class="card">${MODEL.teams.slice().sort((a, b) => b.profile.trades - a.profile.trades).map(t => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(t.name)}</b>${t === MODEL.me ? ' <span class="tag buy">you</span>' : ''} <span class="small">· ${t.profile.trades} trade${t.profile.trades === 1 ? '' : 's'}${record.get(t) ? ` · record ${record.get(t).w}–${record.get(t).l}${record.get(t).d ? '–' + record.get(t).d : ''} · net ${record.get(t).net >= 0 ? '+' : ''}${fmt(record.get(t).net)}` : ''}</span><div>${t.profile.tags.map(g => `<span class="pill" style="margin:3px 4px 0 0">${esc(g)}</span>`).join('')}</div></div>`).join('')}</div>
   <h3 style="margin:18px 0 4px;font-size:16px">Recent trades</h3>
+  <p class="small"><b>Verdicts:</b> Touchdown (great business), Field goal (sensible), Fair catch (no real change), Field position or No-huddle (earlier seasons: building, or going for it now), Punt (sold early while still in the race), Going for it on 4th (a gamble), Hail Mary (bold), Fumble (poor), Pick six (awful).</p>
   <p class="small">Each side also gets a verdict on whether the move suited their situation at the time: their record and simulated playoff chance (your league's rules), against the projected points a week the trade added or cost them now and the long-term value it added or cost them. Trades from earlier seasons are judged on what moved only. Grades are based on values from the day of the trade, for trades since the site started saving daily values (${esc((RAW.history?.dates || [])[0] || 'today')}). Older trades are graded on today's values, with hindsight. Each grade compares what a side got against what it gave, using KTC's value adjustment so a 2-for-1 is judged the way KTC would. A+ means a clear win, B is about even, F is a fleecing. Record is wins–losses(–evens).</p>
   ${log.slice(0, 12).map(e => `<div class="card"><div class="trade-top"><span class="small">${e.when ? new Date(e.when).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : e.season}</span><span class="small" style="text-align:right"><b>${esc(e.verdict)}</b>${e.hindsight ? `<br>${esc(e.hindsight)}` : ''}</span></div>
     <div class="sides">${e.sides.map(sd => `<div class="side"><h4 style="display:flex;justify-content:space-between"><span>${esc(sd.teamName)} got</span><span style="font-size:18px;color:${gradeCol(sd.grade)};letter-spacing:0">${sd.grade}${e.atTime && sd.gradeNow !== sd.grade ? `<span class="small" style="font-size:11px;color:var(--muted)"> now ${sd.gradeNow}</span>` : ''}</span></h4>${sd.got.length ? sd.got.map(a => `<div class="asset"><div><div class="nm">${esc(a.name)}</div><div class="meta">${a.kind === 'pick' ? 'Draft pick' : esc(a.pos) + (a.age ? ' · ' + Math.floor(a.age) + ' then' : '')}</div></div><div class="val">${e.atTime && a.then != null ? `${fmt(a.then)}<div class="small">now ${fmt(a.value)}</div>` : fmt(a.value)}</div></div>`).join('') : '<div class="small">Nothing</div>'}${sd.judge ? `<div class="small" style="margin-top:8px;padding-top:6px;border-top:1px solid var(--line)"><b style="color:${{ good: 'var(--good)', bad: 'var(--bad)', warn: 'var(--warn)', accent: 'var(--accent)', muted: 'var(--muted)' }[sd.judge.tone]}">${esc(sd.judge.label)}:</b> ${esc(sd.judge.text)}</div>` : ''}</div>`).join('')}</div></div>`).join('')}` : ''}`;
